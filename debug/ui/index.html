@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Debug Station · PillPal</title>
+  <meta name="robots" content="noindex">
+  <meta name="theme-color" content="#0B151C">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/__debug/ui/station.css">
+  <script type="module" src="/__debug/ui/station.js"></script>
+</head>
+<body>
+  <a class="skip" href="#view">Skip to content</a>
+  <header class="top">
+    <a class="brand" href="/" title="Back to PillPal"><img src="/icon.svg" alt="" width="26" height="26"><span><b>Debug Station</b><small>PillPal · local only</small></span></a>
+    <div class="conn" id="conn" role="status"><i></i><span>Connecting…</span></div>
+    <div class="kpis" id="kpis" aria-label="Live totals"></div>
+    <div class="top-actions">
+      <button class="btn" id="pauseBtn" data-act="pause" aria-pressed="false" title="Pause / resume the live stream (P)"><span class="ic">⏸</span><span class="lbl">Pause</span></button>
+      <button class="btn ghost" data-act="help" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts">?</button>
+    </div>
+  </header>
+  <div class="frame">
+    <nav class="rail" aria-label="Debug Station views"></nav>
+    <main id="view" tabindex="-1"></main>
+    <aside class="drawer" id="drawer" hidden aria-labelledby="drawerTitle"></aside>
+  </div>
+  <div class="toasts" id="toasts" aria-live="polite"></div>
+  <dialog id="dlg"></dialog>
+</body>
+</html>

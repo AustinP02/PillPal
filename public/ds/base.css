@@ -1,0 +1,24 @@
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;background:var(--bg-page);color:var(--text-body);font-family:var(--font-body);font-size:var(--size-body);line-height:var(--lh-body);-webkit-font-smoothing:antialiased;transition:background var(--dur-base) var(--ease-out),color var(--dur-base) var(--ease-out)}
+h1,h2,h3,h4{font-family:var(--font-display);color:var(--text-strong);margin:0;text-wrap:balance;letter-spacing:var(--tracking-tight)}
+p{margin:0;text-wrap:pretty}
+a{color:var(--brand-text);text-decoration:none;text-underline-offset:3px}
+a:hover{color:var(--brand-hover);text-decoration:underline}
+:focus-visible{outline:none;box-shadow:var(--shadow-focus)}
+::selection{background:var(--brand-soft-strong);color:var(--text-strong)}
+.pp-display-xl{font-family:var(--font-display);font-size:var(--size-display-xl);line-height:var(--lh-display-xl);font-weight:700;letter-spacing:var(--tracking-display);color:var(--text-strong)}
+.pp-display-l{font-family:var(--font-display);font-size:var(--size-display-l);line-height:var(--lh-display-l);font-weight:700;letter-spacing:var(--tracking-display);color:var(--text-strong)}
+.pp-h1{font-family:var(--font-display);font-size:var(--size-h1);line-height:var(--lh-h1);font-weight:700;letter-spacing:-.02em;color:var(--text-strong)}
+.pp-h2{font-family:var(--font-display);font-size:var(--size-h2);line-height:var(--lh-h2);font-weight:650;letter-spacing:-.015em;color:var(--text-strong)}
+.pp-h3{font-family:var(--font-display);font-size:var(--size-h3);line-height:var(--lh-h3);font-weight:600;color:var(--text-strong)}
+.pp-h4{font-family:var(--font-body);font-size:var(--size-h4);line-height:var(--lh-h4);font-weight:700;color:var(--text-strong)}
+.pp-body-l{font-size:var(--size-body-l);line-height:var(--lh-body-l)}
+.pp-body{font-size:var(--size-body);line-height:var(--lh-body)}
+.pp-body-s{font-size:var(--size-body-s);line-height:var(--lh-body-s)}
+.pp-caption{font-size:var(--size-caption);line-height:var(--lh-caption);color:var(--text-muted)}
+.pp-overline{font-size:var(--size-caption);line-height:1;font-weight:700;letter-spacing:var(--tracking-overline);text-transform:uppercase;color:var(--brand-text)}
+.pp-mono{font-family:var(--font-mono);font-size:13px;letter-spacing:0}
+.pp-muted{color:var(--text-muted)}
+.pp-container{max-width:var(--container-max);margin:0 auto;padding:0 var(--container-pad)}
+@media (prefers-reduced-motion:reduce){*,*::before,*::after{animation-duration:.01ms!important;transition-duration:.01ms!important}}

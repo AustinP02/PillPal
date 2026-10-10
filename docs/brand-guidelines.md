@@ -2,53 +2,48 @@
 
 ## Promise
 **Your pills, remembered. Your story, ready for your doctor.**
-PillPal helps people take medication on time, understand what they take, and walk into appointments with a clear, honest summary. It also points them toward clinical research and community health resources.
+PillPal helps people take medication on time, understand what they take, and walk into appointments with a clear, honest summary. It also points them toward clinical research and community health resources. The brand should feel sleek, modern and a little playful, but never childish: people are often managing chronic conditions or caring for a parent, so calm, safe and trustworthy comes first.
 
-## Mascot: Pal
-A two-tone capsule (coral top, cream bottom, navy outline) with big round eyes and stick arms.
-Moods map to moments, never to judgement:
+## Mascot: Pip
+An original two-tone capsule (lagoon top, apricot bottom) tilted −14°, with a minimal face on the warm half. Use at most one Pip per screen: onboarding, empty states, streaks and gentle alerts. Never next to clinical warnings.
 
 | Mood | When | Example line |
 |---|---|---|
-| `wave` | First run, empty states, reminders | "Hi, I'm Pal! Let's set up your first medication." |
-| `happy` | Default, upcoming dose | "Next up: Lipitor at 8:00 PM." |
-| `cheer` | All doses logged, scan matched, saved | "All done for today. Nice work!" |
-| `concerned` | Overdue dose, flagged side effect, errors | "2 doses waiting for you." |
-| `focus` | Searching / loading | "Searching ClinicalTrials.gov…" |
+| `happy` | Default, upcoming dose, first run | "Next up: Atorvastatin at 21:30." |
+| `celebrate` | All doses logged, good week | "All done for today. Nice work." |
+| `alert` | Dose due, flagged side effect, errors | "1 dose waiting for you." |
+| `wink` | Thinking, searching, prompts | "Save today's check-in and I'll tell you what I'm noticing." |
+| `sleepy` | Nothing found | "No recruiting studies matched." |
 
-Pal never scolds, never diagnoses, and never gives dosing advice. Missed doses are stated plainly, with a next step.
+Pip never scolds, never diagnoses, and never gives dosing advice. Missed doses are stated plainly, with a next step.
 
 ## Voice
-- **Warm, plain, short.** Aim for a 6th-grade reading level. One idea per sentence.
-- **Say what to do next.** "Tap Taken once you've had it." Not "Dose overdue."
-- **Honest about limits.** Information comes from FDA labels. The prescription label and the pharmacist come first. Emergencies: 911 and Poison Help (1-800-222-1222).
-- **Avoid:** guilt ("You failed"), medical jargon without explanation, exclamation-heavy hype, emoji in clinical content.
+- **A calm, competent friend.** Warm and plain, about a 6th-grade reading level. Never clinical, never cutesy.
+- **Sentence case everywhere.** Overlines are the only uppercase text. Buttons start with a verb: Take, Scan, Snooze, Add medication.
+- **Say what to do next, without blame.** "Couldn't read that. Try a bit more light." Not "Recognition failure."
+- **Honest about limits.** Information comes from FDA labels. The prescription label and the pharmacist come first. Emergencies: 911, Poison Help 1-800-222-1222, 988.
+- **No emoji.** Pip carries the emotion. Celebrations are small and sincere: "Nice. That's 12 days in a row."
+- Name + strength together ("Metformin · 500 mg"), times in mono (`8:00`, `21:30`), `·` as the separator.
 
 ## Color
 | Token | Light | Dark | Use |
 |---|---|---|---|
-| `--brand` | `#0B7A75` | `#43C7BC` | Primary actions, focus, progress |
-| `--coral` | `#FF7A59` | same | Pal, due-now highlights (decorative, never body text) |
-| `--sun` | `#FFC94D` | same | Streaks, partial days, study badges |
-| `--ink` | `#10233A` | `#E9F2F1` | Text |
-| `--ink-2` | `#48596B` | `#A8BCC3` | Secondary text |
-| `--ok` / `--danger` | `#1D7F46` / `#B8322A` | `#6BD49A` / `#FF8A80` | Status (always paired with an icon or word) |
+| `--brand` (Lagoon) | `#127479` | `#4DB9BB` | Primary actions, links, focus, progress |
+| `--accent` (Apricot) | `#EE6F33` | `#FF9A63` | Streaks, avatar, Pip's lower half |
+| `--status-taken` (Mint) | `#1F9D6B` | `#3CC48D` | Taken doses |
+| `--status-due` (Honey) | `#E0A21B` | `#F2B83B` | Due now |
+| `--status-missed` (Rose) | `#D64545` | `#F06A6A` | Missed doses, boxed warnings, emergencies only |
+| `--bg-page` | `#F7F9F8` | `#0A1112` | Page background (never pure black) |
 
-All text pairs meet WCAG 2.2 AA (4.5:1). Status is never shown by color alone.
+Status colors are always paired with a word or icon. No neon, no purple AI gradients.
 
 ## Type
-- **Lexend** for headings. Designed for reading proficiency.
-- **Atkinson Hyperlegible** for everything else. Designed by the Braille Institute for low-vision readers; distinct 0/O, 1/l/I.
-- Base 17px; "Larger text" setting raises it to 21px. Never below 13px.
+- **Bricolage Grotesque**: headlines, big numbers, wordmark.
+- **Figtree**: all UI and body text, 16px minimum body.
+- **JetBrains Mono**: times only.
+
+## Shape and motion
+Cards 20px radius, dialogs and the scan frame 28px; buttons, badges, tags and tabs are full pills. Soft teal-tinted shadows. Springy presses (buttons scale to .97), a gentle Pip bob, and a sweeping scan line. "Reduce motion" turns all of it off.
 
 ## Accessibility commitments
-Grounded in W3C's older-users guidance and medication-adherence usability research (large fonts, simple layouts, voice prompts, confirm and undo):
-- 44px+ touch targets; full keyboard support; visible focus rings; skip link.
-- Settings for larger text, high contrast, reduced motion, light/dark theme, and spoken reminders.
-- Every action has a clear confirmation (sound + toast + screen-reader announcement) and an Undo.
-- Native `<dialog>`, labelled form fields, `aria-live` updates, charts with text alternatives.
-- `prefers-reduced-motion` is respected automatically.
-
-## Assets
-- `public/icon.svg`: app icon (Pal on a teal tile).
-- Pal is drawn in code (`pal()` in `public/app.js`) so it scales and themes without image files.
+44px minimum touch targets, visible 3px focus halos, skip link, live regions for dose logging and results, larger text and high contrast options, read-aloud reminders, and a printable doctor report.
