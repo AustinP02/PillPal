@@ -1,0 +1,10 @@
+{
+  "name": "PillPal",
+  "short_name": "PillPal",
+  "description": "Medication tracker, bottle scanner and doctor-ready reports.",
+  "start_url": "/#/today",
+  "display": "standalone",
+  "background_color": "#F4F8F7",
+  "theme_color": "#0B7A75",
+  "icons": [{ "src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}
