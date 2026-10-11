@@ -68,3 +68,66 @@ console.log('ocr fixes ok');
 assert.deepEqual(parseSig('TAKE 1 TABLET BY MOUTH TWICE').times, ['08:00', '20:00']);
 assert.deepEqual(parseSig('Take 1 tablet twice a week').times, []);
 console.log('wrapped directions ok');
+
+// mixing checks: class words on labels, and the label's own strength of wording
+{
+  const { mixNames, mixLevel, mentions } = await import('./logic.js');
+  const advil = mixNames('Advil', ['ibuprofen']);
+  assert.ok(advil.includes('NSAIDs') && advil.includes('ibuprofen'));
+  assert.deepEqual(mixNames('Salt', ['sodium chloride']), ['Salt', 'sodium chloride']);
+  assert.ok(mixNames('K-Tab', ['potassium chloride']).includes('potassium supplements'));
+  assert.equal(mentions('Use of NSAIDs with ACE inhibitors may result in deterioration of renal function.', advil)[0].name, 'NSAIDs');
+  assert.equal(mixLevel('Do not coadminister aliskiren with lisinopril in patients with diabetes.'), 'avoid');
+  assert.equal(mixLevel('Concomitant use is contraindicated.'), 'avoid');
+  assert.equal(mixLevel('May increase the blood-glucose-lowering effect.'), 'caution');
+  console.log('mix checks ok');
+}
+
+// dose timer intervals and liquid detection
+{
+  const { hoursFromDirections: h, scheduleHours, isLiquid } = await import('./logic.js');
+  assert.equal(h('Take 1 tablet every 6 hours'), 6);
+  assert.equal(h('1 tablet every 4 to 6 hours as needed'), 4);
+  assert.equal(h('TAKE 1 TABLET BY MOUTH TWICE DAILY'), 12);
+  assert.equal(h('three times a day'), 8);
+  assert.equal(h('once weekly on Sunday'), 168);
+  assert.equal(h('with food'), null);
+  assert.equal(scheduleHours(['08:00', '14:00', '20:00']), 8);
+  assert.ok(isLiquid('5 mL') && isLiquid('Amoxicillin oral suspension') && !isLiquid('10 mg tablet'));
+  console.log('timer intervals ok');
+}
+
+// demo mode story
+{
+  const { buildDemo, demoChat, demoMixes } = await import('./demo.js');
+  const d = buildDemo({ today: '2026-10-11', now: '12:20', tz: 240, nowMs: Date.UTC(2026, 9, 11, 16, 20) });
+  assert.equal(d.meds.length, 9);
+  assert.ok(d.meds.some(m => m.form === 'liquid') && d.meds.some(m => m.shape === 'capsule') && d.meds.some(m => m.trialId));
+  const advil = d.meds.find(m => m.name === 'Advil');
+  assert.ok(+advil.timer.endsAt - Date.UTC(2026, 9, 11, 16, 20) <= 3 * 60e3, 'Advil comes due within minutes');
+  assert.ok(d.meds.find(m => m.name === 'Lisinopril').snooze);
+  assert.equal(d.checkins.filter(c => c.sideEffects.includes('Nausea')).length, 6);
+  assert.ok(d.vitals.length > 60 && d.effects.length === 4 && d.studies[0].nctId === 'NCT05971940');
+  assert.ok(!d.doses.some(x => x.date === '2026-10-11' && x.time >= '12:20' && x.at > new Date(Date.UTC(2026, 9, 11, 16, 20))), 'no future doses');
+  assert.match(demoChat('Can I take ibuprofen with my meds?', { adherence: 90, streak: 9, flagged: [] }, []), /lisinopril/);
+  assert.equal(demoMixes([{ _id: 'a', name: 'Lisinopril' }, { _id: 'b', name: 'Advil' }]).pairs.length, 1);
+  console.log('demo ok');
+}
+
+// health log ranges and trial matching
+{
+  const { vitalFlag, summarizeVitals, quickFit, mapStudy, ctgovSearchUrl } = await import('./logic.js');
+  assert.equal(vitalFlag({ type: 'bp', value: 182, value2: 100 }).level, 'urgent');
+  assert.equal(vitalFlag({ type: 'bp', value: 142, value2: 85 }).level, 'high');
+  assert.equal(vitalFlag({ type: 'bp', value: 118, value2: 76 }), null);
+  assert.equal(vitalFlag({ type: 'glucose', value: 66 }).level, 'low');
+  assert.equal(vitalFlag({ type: 'temp', value: 100.9 }).level, 'high');
+  const sv = summarizeVitals([{ type: 'bp', value: 140, value2: 90, at: '2026-01-01' }, { type: 'bp', value: 120, value2: 80, at: '2026-01-02' }]);
+  assert.equal(sv[0].avg, 130); assert.equal(sv[0].avg2, 85); assert.equal(sv[0].latest.value, 120); assert.equal(sv[0].flagged, 1);
+  assert.deepEqual(quickFit({ minAge: '65 Years', sex: 'ALL' }, { age: 58, sex: 'female' }), { fits: false, why: ['for ages 65 years and up'] });
+  assert.ok(quickFit({ minAge: '18 Years', sex: 'FEMALE' }, { age: 58, sex: 'female' }).fits);
+  const t = mapStudy({ protocolSection: { identificationModule: { nctId: 'NCT05971940', briefTitle: 'X' }, eligibilityModule: { minimumAge: '18 Years', sex: 'ALL' } } });
+  assert.equal(t.id, 'NCT05971940'); assert.equal(t.minAge, '18 Years');
+  assert.match(ctgovSearchUrl({ cond: 'type 2 diabetes', loc: 'NJ' }), /^https:\/\/clinicaltrials\.gov\/search\?cond=type\+2\+diabetes&locStr=NJ&aggFilters=status%3Arec$/);
+  console.log('health log + trials ok');
+}

@@ -196,3 +196,141 @@ export function mentions(text = '', names = []) {
   }
   return found;
 }
+
+// ---------- mixing checks ----------
+// Labels often warn about a drug class ("NSAIDs", "blood thinners") rather than by name, so each ingredient also
+// answers to the class words a label would use. Curated for common outpatient meds; unknown drugs fall back to their name.
+const CLASSES = [
+  [['NSAID', 'NSAIDs', 'nonsteroidal anti-inflammatory', 'pain reliever', 'pain relievers'], 'ibuprofen naproxen aspirin diclofenac celecoxib meloxicam ketorolac indomethacin etodolac nabumetone'],
+  [['anticoagulant', 'anticoagulants', 'blood thinner', 'blood thinners', 'antiplatelet'], 'warfarin apixaban rivaroxaban dabigatran edoxaban clopidogrel heparin enoxaparin'],
+  [['ACE inhibitor', 'ACE inhibitors', 'angiotensin-converting enzyme'], 'lisinopril enalapril ramipril benazepril captopril quinapril fosinopril'],
+  [['ARB', 'ARBs', 'angiotensin receptor blocker', 'angiotensin II receptor'], 'losartan valsartan irbesartan olmesartan candesartan telmisartan'],
+  [['diuretic', 'diuretics', 'water pill'], 'hydrochlorothiazide furosemide chlorthalidone spironolactone torsemide bumetanide triamterene'],
+  [['potassium-sparing', 'potassium supplements', 'potassium supplement'], 'spironolactone triamterene amiloride eplerenone potassium_chloride'],
+  [['SSRI', 'SSRIs', 'selective serotonin reuptake', 'serotonergic', 'antidepressant', 'antidepressants'], 'sertraline fluoxetine citalopram escitalopram paroxetine fluvoxamine'],
+  [['SNRI', 'SNRIs', 'serotonergic', 'antidepressant', 'antidepressants'], 'venlafaxine duloxetine desvenlafaxine'],
+  [['MAOI', 'MAOIs', 'monoamine oxidase inhibitor', 'MAO inhibitor', 'MAO inhibitors'], 'phenelzine tranylcypromine selegiline isocarboxazid rasagiline'],
+  [['opioid', 'opioids', 'narcotic', 'CNS depressants'], 'oxycodone hydrocodone morphine tramadol codeine fentanyl hydromorphone methadone tapentadol'],
+  [['benzodiazepine', 'benzodiazepines', 'CNS depressants', 'sedative', 'sedatives'], 'alprazolam lorazepam diazepam clonazepam temazepam'],
+  [['statin', 'statins', 'HMG-CoA reductase'], 'atorvastatin simvastatin rosuvastatin pravastatin lovastatin pitavastatin'],
+  [['beta blocker', 'beta blockers', 'beta-blocker', 'beta-blockers', 'beta-adrenergic'], 'metoprolol atenolol propranolol carvedilol bisoprolol nebivolol labetalol'],
+  [['sulfonylurea', 'sulfonylureas', 'insulin secretagogue', 'insulin secretagogues'], 'glipizide glyburide glimepiride'],
+  [['nitrate', 'nitrates'], 'nitroglycerin isosorbide'],
+  [['PDE5 inhibitor', 'PDE-5 inhibitors', 'phosphodiesterase'], 'sildenafil tadalafil vardenafil'],
+  [['triptan', 'triptans', 'serotonergic'], 'sumatriptan rizatriptan zolmitriptan eletriptan'],
+  [['antacid', 'antacids'], 'calcium_carbonate aluminum_hydroxide magnesium_hydroxide'],
+  [['thyroid hormone', 'thyroid hormones'], 'levothyroxine liothyronine'],
+];
+const CLASS_OF = new Map();
+for (const [terms, drugs] of CLASSES) for (const d of drugs.split(' ').map(x => x.replace('_', ' '))) CLASS_OF.set(d, [...(CLASS_OF.get(d) || []), ...terms]);
+// Names a label might use for a med: its own name, its ingredients, and their classes.
+export function mixNames(name = '', ingredients = []) {
+  const ing = ingredients.map(i => String(i).toLowerCase());
+  const words = ing.flatMap(i => i.split(/[\s/]+/));
+  const classes = [...ing, ...words].flatMap(w => CLASS_OF.get(w) || []);
+  return [...new Set([name, ...ingredients, ...classes].filter(x => x && x.length >= 3))];
+}
+// How strongly the label words it. Pip never judges beyond the label's own wording.
+export const mixLevel = (snippet = '') =>
+  /contraindicat|do not (use|take|combine|coadminister)|should not be (used|taken|given|coadministered)|avoid (use|taking|concomitant|co-?administration|combin)|must not/i.test(snippet) ? 'avoid' : 'caution';
+
+// ---------- dose timers ----------
+// Hours between doses stated in directions: "every 6 hours", "q8h", "every 4 to 6 hours" (the shorter gap is the earliest
+// next dose), "twice daily" = 12, "once weekly" = 168. null when the text doesn't say.
+export function hoursFromDirections(text = '') {
+  const t = ` ${String(text).toLowerCase().replace(/\s+/g, ' ')} `;
+  let m = t.match(/\bevery (\d+(?:\.\d+)?)(?:\s*(?:-|to|or)\s*(\d+(?:\.\d+)?))? ?(?:hours?|hrs?|h)\b/) || t.match(/\bq ?(\d+) ?h\b/);
+  if (m) return +m[1];
+  if (/\b(once (a|per|each)? ?week|once weekly|every week|weekly)\b/.test(t)) return 168;
+  if (/\b(every other day|every 2 days|every 48 hours)\b/.test(t)) return 48;
+  if (/\b(four times (a|per|each)? ?day|4 times (a|per|each)? ?day|qid)\b/.test(t)) return 6;
+  if (/\b(three times (a|per|each)? ?day|3 times (a|per|each)? ?day|tid)\b/.test(t)) return 8;
+  if (/\b(twice (a|per|each)? ?day|twice daily|2 times (a|per|each)? ?day|two times (a|per|each)? ?day|bid)\b/.test(t)) return 12;
+  if (/\b(once (a|per|each)? ?day|once daily|every day|each day|daily|qd|nightly|every night|at bedtime)\b/.test(t)) return 24;
+  return null;
+}
+// Without directions: a day split evenly across the reminder times (1 time = 24 h, 2 = 12 h…).
+export const scheduleHours = (times = []) => Math.round(24 / Math.max(1, times.length) * 10) / 10;
+// Liquid vs pills, from what the user typed or the label's dosage form.
+export const isLiquid = (text = '') => /\b(ml|mls|millilit(er|re)s?|teaspoons?|tsp|tablespoons?|tbsp|syrup|solution|suspension|liquid|elixir|drops?|oral sol)\b/i.test(text);
+
+// ---------- health log: measurements ----------
+// Ranges for checking input, plus the gentle flags shown on the log and the report (common adult reference ranges).
+export const VITALS = {
+  bp: { label: 'Blood pressure', unit: 'mmHg', min: 50, max: 260, min2: 30, max2: 160 },
+  weight: { label: 'Weight', unit: 'lb', min: 40, max: 800 },
+  glucose: { label: 'Blood sugar', unit: 'mg/dL', min: 20, max: 600 },
+  temp: { label: 'Temperature', unit: '°F', min: 90, max: 110 },
+  spo2: { label: 'Oxygen', unit: '%', min: 50, max: 100 },
+  pain: { label: 'Pain', unit: '/10', min: 0, max: 10 },
+  a1c: { label: 'A1C', unit: '%', min: 3, max: 20 },
+};
+export const GLUCOSE_CONTEXT = ['fasting', 'before a meal', 'after a meal', 'bedtime', 'other'];
+// null, or { level: 'high' | 'low' | 'urgent', text }.
+export function vitalFlag(v) {
+  const x = +v.value, y = +v.value2;
+  switch (v.type) {
+    case 'bp':
+      if (x >= 180 || y >= 120) return { level: 'urgent', text: 'Very high. Recheck in 5 minutes; with chest pain, shortness of breath, weakness or vision changes, call 911.' };
+      if (x >= 140 || y >= 90) return { level: 'high', text: 'High' };
+      if (x < 90 || y < 60) return { level: 'low', text: 'Low' };
+      return null;
+    case 'glucose':
+      if (x < 54) return { level: 'urgent', text: 'Very low. Have 15 g of fast sugar now (juice, glucose tabs) and recheck in 15 minutes.' };
+      if (x < 70) return { level: 'low', text: 'Low' };
+      if (x >= 300) return { level: 'urgent', text: 'Very high. Follow your care plan and call your care team.' };
+      if (x > 180) return { level: 'high', text: 'High' };
+      return null;
+    case 'temp': return x >= 103 ? { level: 'urgent', text: 'High fever. Call your care team.' } : x >= 100.4 ? { level: 'high', text: 'Fever' } : x < 95 ? { level: 'low', text: 'Low' } : null;
+    case 'spo2': return x < 90 ? { level: 'urgent', text: 'Low oxygen. If you are short of breath, call 911.' } : x < 95 ? { level: 'low', text: 'A bit low' } : null;
+    case 'pain': return x >= 7 ? { level: 'high', text: 'Severe pain' } : null;
+    case 'a1c': return x >= 6.5 ? { level: 'high', text: 'Above the usual goal (talk with your doctor about yours)' } : null;
+    default: return null;
+  }
+}
+export const vitalText = v => (v.type === 'bp' ? `${v.value}/${v.value2}${v.pulse ? `, pulse ${v.pulse}` : ''}` : `${v.value}`);
+// Per type: count, latest, average, range, flagged count, and a trend series (oldest first).
+export function summarizeVitals(list = []) {
+  const out = [];
+  for (const type of Object.keys(VITALS)) {
+    const xs = list.filter(v => v.type === type).sort((a, b) => new Date(a.at) - new Date(b.at));
+    if (!xs.length) continue;
+    const avg = k => Math.round(xs.reduce((s, v) => s + +v[k], 0) / xs.length * 10) / 10;
+    out.push({ type, label: VITALS[type].label, unit: VITALS[type].unit, count: xs.length, latest: xs.at(-1), first: xs[0],
+      avg: avg('value'), avg2: type === 'bp' ? avg('value2') : null,
+      min: Math.min(...xs.map(v => +v.value)), max: Math.max(...xs.map(v => +v.value)),
+      flagged: xs.filter(v => vitalFlag(v)).length, series: xs.map(v => ({ at: v.at, date: v.date, value: +v.value, value2: v.value2 == null ? null : +v.value2 })) });
+  }
+  return out;
+}
+
+// ---------- clinical trials ----------
+// ClinicalTrials.gov API v2 study → what PillPal shows. Used by the server, and mirrored in the browser fallback.
+export function mapStudy(s, near = '') {
+  const ps = s.protocolSection || {}, el = ps.eligibilityModule || {};
+  const locs = [...new Set((ps.contactsLocationsModule?.locations || []).map(l => [l.city, l.state || l.country].filter(Boolean).join(', ')))];
+  const n = near.toLowerCase();
+  return {
+    id: ps.identificationModule?.nctId, title: ps.identificationModule?.briefTitle || '', status: ps.statusModule?.overallStatus || '',
+    conditions: (ps.conditionsModule?.conditions || []).slice(0, 4), phases: ps.designModule?.phases || [],
+    sponsor: ps.sponsorCollaboratorsModule?.leadSponsor?.name || '', summary: String(ps.descriptionModule?.briefSummary || '').replace(/\s+/g, ' ').slice(0, 260),
+    minAge: el.minimumAge || '', maxAge: el.maximumAge || '', sex: el.sex || 'ALL', healthy: !!el.healthyVolunteers,
+    criteria: String(el.eligibilityCriteria || '').slice(0, 3000),
+    locationCount: locs.length, locations: (n ? [...locs.filter(l => l.toLowerCase().includes(n)), ...locs.filter(l => !l.toLowerCase().includes(n))] : locs).slice(0, 3),
+  };
+}
+export const STUDY_FIELDS = 'NCTId,BriefTitle,OverallStatus,Condition,Phase,BriefSummary,LocationCity,LocationState,LocationCountry,LeadSponsorName,MinimumAge,MaximumAge,Sex,HealthyVolunteers,EligibilityCriteria';
+// "18 Years" / "6 Months" → years.
+export const ageYears = s => { const m = /([\d.]+)\s*(year|month|week|day)/i.exec(s || ''); if (!m) return null; const u = m[2].toLowerCase(); return +m[1] / (u === 'year' ? 1 : u === 'month' ? 12 : u === 'week' ? 52 : 365); };
+// Does a profile clearly fall outside the study's age or sex limits? (Everything else is for the study team.)
+export function quickFit(t, { age, sex } = {}) {
+  const why = [];
+  const lo = ageYears(t.minAge), hi = ageYears(t.maxAge);
+  if (age != null && lo != null && age < lo) why.push(`for ages ${t.minAge.toLowerCase()} and up`);
+  if (age != null && hi != null && age > hi) why.push(`for ages up to ${t.maxAge.toLowerCase()}`);
+  if (sex && t.sex && t.sex !== 'ALL' && t.sex.toLowerCase() !== sex.toLowerCase()) why.push(`for ${t.sex.toLowerCase()} participants only`);
+  return { fits: !why.length, why };
+}
+// The ClinicalTrials.gov website search for the same query: a working link even when the API can't be reached.
+export const ctgovSearchUrl = ({ cond = '', intr = '', loc = '' }) =>
+  'https://clinicaltrials.gov/search?' + new URLSearchParams(Object.entries({ cond, intr, locStr: loc, aggFilters: 'status:rec' }).filter(([, v]) => v));

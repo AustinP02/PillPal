@@ -2,30 +2,68 @@ import express from 'express';
 import { MongoClient, ObjectId } from 'mongodb';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
+import os from 'node:os';
+import https from 'node:https';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { extractCandidates, buildReport, addDays, bestWordSim, productNdcSplits, parseSig, pillLook, mentions as mentionsOf } from './logic.js';
+import { buildDemo, demoMixes, demoChat, demoExplain, demoInsight, demoVisitPrep, demoPrecheck } from './demo.js';
+import { extractCandidates, buildReport, addDays, bestWordSim, productNdcSplits, parseSig, pillLook, mentions as mentionsOf, mixNames, mixLevel, hoursFromDirections, scheduleHours, isLiquid, VITALS, GLUCOSE_CONTEXT, vitalFlag, vitalText, summarizeVitals, mapStudy, STUDY_FIELDS, quickFit, ctgovSearchUrl } from './logic.js';
 
 const scrypt = promisify(crypto.scrypt);
 const PORT = process.env.PORT || 3000;
 const GEMINI_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-flash-latest';
+// Google's picks for new projects (Oct 2026): 3.8 Flash for answers, 3.5 Flash-Lite for fast reading. 2.5 models are
+// restricted to accounts that already used them, so they're no longer in the fallback list.
+const GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-3.8-flash';
+const FAST_MODEL = process.env.GEMINI_SCAN_MODEL || 'gemini-3.5-flash-lite';
 const PROD = process.env.NODE_ENV === 'production';
 const DIR = import.meta.dirname;
 
 // ---------- database ----------
-async function connect() {
-  let uri = process.env.MONGODB_URI;
-  if (!uri) {
-    // Zero-setup local dev: embedded mongod persisted to .data/db. Set MONGODB_URI (e.g. Atlas) for real deploys.
-    const { MongoMemoryServer } = await import('mongodb-memory-server');
-    const dbPath = path.join(DIR, '.data', 'db');
-    fs.mkdirSync(dbPath, { recursive: true });
-    const mongod = await MongoMemoryServer.create({ instance: { dbPath, storageEngine: 'wiredTiger' } });
-    uri = mongod.getUri();
-    console.log(`No MONGODB_URI set, using embedded MongoDB at ${dbPath}`);
+// Zero-setup local dev runs an embedded mongod. Its files live OUTSIDE the project folder: the project sits in OneDrive,
+// and OneDrive syncing/locking the database files makes mongod crash mid-run (ECONNREFUSED). If it still stops, it is
+// restarted on the same port and the driver reconnects by itself. Set MONGODB_URI (e.g. Atlas) for real deploys.
+function localDbPath() {
+  if (process.env.PILLPAL_DB_DIR) return process.env.PILLPAL_DB_DIR;
+  const base = process.env.LOCALAPPDATA || (process.platform === 'darwin' ? path.join(os.homedir(), 'Library', 'Application Support') : path.join(os.homedir(), '.local', 'share'));
+  return path.join(base, 'PillPal', 'db');
+}
+async function embeddedMongo() {
+  const { MongoMemoryServer } = await import('mongodb-memory-server');
+  const dbPath = localDbPath(), old = path.join(DIR, '.data', 'db');
+  // One-time move of data saved by earlier versions (inside the synced project folder).
+  if (!fs.existsSync(dbPath) && fs.existsSync(old) && fs.readdirSync(old).length) {
+    const tmp = dbPath + '.copying';
+    try { fs.rmSync(tmp, { recursive: true, force: true }); fs.cpSync(old, tmp, { recursive: true }); fs.renameSync(tmp, dbPath); console.log(`Copied your existing PillPal data from ${old} to ${dbPath}`); }
+    catch (e) { fs.rmSync(tmp, { recursive: true, force: true }); console.error(`Couldn't copy old data (${e.message}); starting with a fresh database.`); }
   }
-  const db = (await new MongoClient(uri).connect()).db(process.env.MONGODB_DB || 'pillpal');
+  fs.mkdirSync(dbPath, { recursive: true });
+  let port, restarts = [];
+  const start = async () => {
+    const m = await MongoMemoryServer.create({ instance: { dbPath, storageEngine: 'wiredTiger', ...(port && { port }) } });
+    port = m.instanceInfo.port;
+    const inst = m.instanceInfo.instance, lines = [];
+    inst.on('instanceSTDOUT', t => { for (const l of String(t).split('\n')) if (/"s":"(E|F|W)"|error|denied|lock/i.test(l)) { lines.push(l.slice(0, 400)); if (lines.length > 8) lines.shift(); } });
+    inst.on('instanceSTDERR', t => { lines.push(String(t).slice(0, 400)); if (lines.length > 8) lines.shift(); });
+    inst.once('instanceClosed', async code => {
+      if (stopping) return;
+      console.error(`Embedded MongoDB stopped unexpectedly (exit code ${code}).${lines.length ? ' Last messages:\n  ' + lines.join('\n  ') : ''}`);
+      restarts = restarts.filter(t => Date.now() - t < 60e3);
+      if (restarts.length >= 3) return console.error('It keeps stopping. Close other PillPal windows, or set MONGODB_URI to a MongoDB Atlas database in .env.');
+      restarts.push(Date.now());
+      try { await start(); console.log(`Embedded MongoDB restarted on port ${port}.`); } catch (e) { console.error('Could not restart MongoDB:', e.message); }
+    });
+    return m;
+  };
+  let stopping = false;
+  process.once('SIGINT', () => { stopping = true; process.exit(0); });
+  const m = await start();
+  console.log(`No MONGODB_URI set, using embedded MongoDB at ${dbPath}`);
+  return m.getUri();
+}
+async function connect() {
+  const uri = process.env.MONGODB_URI || await embeddedMongo();
+  const db = (await new MongoClient(uri, { serverSelectionTimeoutMS: 15000 }).connect()).db(process.env.MONGODB_DB || 'pillpal');
   await Promise.all([
     db.collection('users').createIndex({ email: 1 }, { unique: true }),
     db.collection('sessions').createIndex({ expiresAt: 1 }, { expireAfterSeconds: 0 }),
@@ -33,12 +71,16 @@ async function connect() {
     db.collection('doses').createIndex({ userId: 1, medId: 1, date: 1, time: 1 }, { unique: true }),
     db.collection('checkins').createIndex({ userId: 1, date: 1 }, { unique: true }),
     db.collection('scanfixes').createIndex({ userId: 1, word: 1 }, { unique: true }),
+    db.collection('medcheckins').createIndex({ userId: 1, medId: 1, at: -1 }),
+    db.collection('vitals').createIndex({ userId: 1, at: -1 }),
+    db.collection('effects').createIndex({ userId: 1, startDate: -1 }),
   ]);
   return db;
 }
 const db = await connect();
 const users = db.collection('users'), sessions = db.collection('sessions'), meds = db.collection('meds'),
-  doses = db.collection('doses'), checkins = db.collection('checkins'), scanfixes = db.collection('scanfixes');
+  doses = db.collection('doses'), checkins = db.collection('checkins'), scanfixes = db.collection('scanfixes'),
+  medcheckins = db.collection('medcheckins'), vitals = db.collection('vitals'), effects = db.collection('effects');
 
 // ---------- validation ----------
 const bad = (msg, status = 400) => Object.assign(new Error(msg), { status });
@@ -67,6 +109,9 @@ function medInput(b) {
     instructions: str(b.instructions, 200, 'Instructions', false),
     color: /^#[0-9a-f]{6}$/i.test(b.color) ? b.color : '#F1F4F4',
     shape: ['round', 'oval', 'capsule'].includes(b.shape) ? b.shape : 'round',
+    form: ['pill', 'liquid'].includes(b.form) ? b.form : isLiquid(`${b.dose} ${b.name} ${b.instructions}`) ? 'liquid' : 'pill',
+    // Hours between doses. Blank = Pip works it out (see intervalFor); a number here is the user's own setting.
+    intervalHours: num(b.intervalHours, 0.5, 168, 'Hours between doses'),
     times, trialId,
     // Refill info (optional; usually read off the label by Scan). Drives run-out and discard-after reminders.
     quantity: num(b.quantity, 0, 10000, 'Quantity'),
@@ -102,11 +147,13 @@ async function startSession(res, userId) {
   res.cookie('pp_session', token, { httpOnly: true, sameSite: 'lax', secure: PROD, maxAge, path: '/' });
 }
 
+const ctxCache = new Map(); // userId -> { at, ctx }: what Pip knows, reused across chat messages for a minute
 async function auth(req, res, next) {
   const t = cookies(req).pp_session;
   const s = t && await sessions.findOne({ _id: sha(t), expiresAt: { $gt: new Date() } });
   if (!s) throw bad('Please sign in', 401);
   req.userId = s.userId;
+  if (req.method !== 'GET' && !req.path.startsWith('/api/ai')) ctxCache.delete(String(s.userId)); // their data changed: Pip's context is stale
   next();
 }
 
@@ -115,7 +162,7 @@ const attempts = new Map();
 const limited = k => { const a = attempts.get(k); return a && a.until > Date.now() && a.n >= 8; };
 const failed = k => { const a = attempts.get(k); if (!a || a.until < Date.now()) attempts.set(k, { n: 1, until: Date.now() + 15 * 6e4 }); else a.n++; };
 
-const publicUser = u => ({ name: u.name, email: u.email, prefs: u.prefs || {}, ai: !!GEMINI_KEY });
+const publicUser = u => ({ name: u.name, email: u.email, prefs: u.prefs || {}, ai: !!GEMINI_KEY || !!u.demo, demo: !!u.demo });
 
 // ---------- app ----------
 const app = express();
@@ -127,6 +174,8 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.static(path.join(DIR, 'public'), { maxAge: PROD ? '1h' : 0 }));
+// logic.js is shared: the browser imports it too (trial matching, measurement ranges).
+app.get('/logic.js', (req, res) => res.type('text/javascript').sendFile(path.join(DIR, 'logic.js')));
 
 app.post('/api/signup', async (req, res) => {
   const name = str(req.body.name, 60, 'Name');
@@ -149,7 +198,7 @@ app.post('/api/login', async (req, res) => {
   const key = `${req.ip}|${email}`;
   if (limited(key)) throw bad('Too many attempts. Try again in 15 minutes.', 429);
   const u = await users.findOne({ email });
-  if (!u || !(await verifyPw(str(req.body.password, 200, 'Password'), u.passHash))) {
+  if (!u || u.demo || !(await verifyPw(str(req.body.password, 200, 'Password'), u.passHash))) {
     failed(key);
     throw bad('Email or password is incorrect', 401);
   }
@@ -169,7 +218,7 @@ app.get('/api/me', auth, async (req, res) => res.json(publicUser(await users.fin
 app.patch('/api/me', auth, async (req, res) => {
   const p = req.body.prefs || {};
   const prefs = Object.fromEntries(['largeText', 'highContrast', 'voice', 'reduceMotion', 'noAi'].map(k => [k, !!p[k]]));
-  prefs.theme = ['light', 'dark'].includes(p.theme) ? p.theme : 'system';
+  prefs.theme = ['light', 'warm', 'dark'].includes(p.theme) ? p.theme : 'system';
   await users.updateOne({ _id: req.userId }, { $set: { prefs } });
   res.json({ prefs });
 });
@@ -189,18 +238,37 @@ app.post('/api/meds', auth, async (req, res) => {
 
 app.put('/api/meds/:id', auth, async (req, res) => {
   const input = medInput(req.body);
-  const r = await meds.findOneAndUpdate({ _id: oid(req.params.id), userId: req.userId }, { $set: input }, { returnDocument: 'after' });
+  const r = await meds.findOneAndUpdate({ _id: oid(req.params.id), userId: req.userId }, { $set: { ...input, interval: null } }, { returnDocument: 'after' });
   if (!r) throw bad('Medication not found', 404);
   ingredientsFor(input.name).then(ingredients => ingredients.length && meds.updateOne({ _id: r._id }, { $set: { ingredients } })).catch(() => {});
   res.json(r);
 });
 
-// Soft delete: history stays in the clinician report.
+// "Stop tracking" is a soft delete: history stays in the clinician report.
+// "Remove" (?remove=1) deletes the medication and everything logged for it.
 app.delete('/api/meds/:id', auth, async (req, res) => {
-  const r = await meds.updateOne({ _id: oid(req.params.id), userId: req.userId },
-    { $set: { active: false, endDate: addDays(date(req.query.today, 'today'), -1) } });
+  const _id = oid(req.params.id);
+  if (req.query.remove === '1') {
+    if (!(await meds.countDocuments({ _id, userId: req.userId }))) throw bad('Medication not found', 404);
+    await Promise.all([meds.deleteOne({ _id, userId: req.userId }), doses.deleteMany({ userId: req.userId, medId: String(_id) }),
+      medcheckins.deleteMany({ userId: req.userId, medId: String(_id) })]);
+    return res.json({ ok: true, removed: true });
+  }
+  const r = await meds.updateOne({ _id, userId: req.userId }, { $set: { active: false, endDate: addDays(date(req.query.today, 'today'), -1) } });
   if (!r.matchedCount) throw bad('Medication not found', 404);
   res.json({ ok: true });
+});
+
+// "Remind me in X minutes" for a dose that's due. One snooze per med; logging the dose clears it.
+app.post('/api/meds/:id/snooze', auth, async (req, res) => {
+  const minutes = num(req.body.minutes, 1, 240, 'Minutes');
+  if (minutes == null) throw bad('How many minutes?');
+  const time = req.body.time;
+  if (!TIME.test(time)) throw bad('Invalid time');
+  const snooze = { date: date(req.body.date), time, from: new Date(), until: new Date(Date.now() + Math.round(minutes) * 60e3) };
+  const r = await meds.updateOne({ _id: oid(req.params.id), userId: req.userId }, { $set: { snooze } });
+  if (!r.matchedCount) throw bad('Medication not found', 404);
+  res.json({ snooze });
 });
 
 // Before adding a med: is the same ingredient already tracked? (Lipitor vs atorvastatin, or a strength change.)
@@ -213,15 +281,36 @@ app.post('/api/meds/check', auth, async (req, res) => {
 app.get('/api/doses', auth, async (req, res) =>
   res.json(await doses.find({ userId: req.userId, date: date(req.query.date) }, { projection: { _id: 0, medId: 1, time: 1, status: 1, at: 1 } }).toArray()));
 
+// Doses taken since yesterday: the dose timers count from the last one taken for each med.
+app.get('/api/doses/recent', auth, async (req, res) => {
+  const today = date(req.query.today, 'today');
+  res.json(await doses.find({ userId: req.userId, status: 'taken', date: { $gte: addDays(today, -1), $lte: today } },
+    { projection: { _id: 0, medId: 1, date: 1, time: 1, at: 1 } }).sort({ at: 1 }).toArray());
+});
+
 app.post('/api/doses', auth, async (req, res) => {
   const { medId, status } = req.body;
   const key = { userId: req.userId, medId: String(oid(medId)), date: date(req.body.date), time: req.body.time };
   if (!TIME.test(key.time)) throw bad('Invalid time');
   if (!(await meds.countDocuments({ _id: oid(medId), userId: req.userId }))) throw bad('Medication not found', 404);
-  if (status == null) await doses.deleteOne(key);
-  else if (['taken', 'skipped'].includes(status)) await doses.updateOne(key, { $set: { status, at: new Date() } }, { upsert: true });
-  else throw bad('Invalid status');
-  res.json({ ok: true });
+  const m = await meds.findOne({ _id: oid(medId), userId: req.userId });
+  // The dose timer: Take starts a countdown of the med's interval; Undo of that dose resets it until the next Take.
+  // Skip never starts one; skipping the dose a finished timer was waiting for clears that timer.
+  let timer = m.timer || null;
+  const now = new Date();
+  if (status == null) {
+    await doses.deleteOne(key);
+    if (timer && timer.date === key.date && timer.time === key.time) timer = null;
+  } else if (status === 'taken') {
+    const hours = m.interval?.hours || fallbackInterval(m).hours;
+    await doses.updateOne(key, { $set: { status, at: now } }, { upsert: true });
+    timer = { startedAt: now, endsAt: new Date(+now + hours * 3600e3), hours, date: key.date, time: key.time, status };
+  } else if (status === 'skipped') {
+    await doses.updateOne(key, { $set: { status, at: now } }, { upsert: true });
+    if (timer && (new Date(timer.endsAt) <= now || req.body.endTimer === true)) timer = null;
+  } else throw bad('Invalid status');
+  await meds.updateOne({ _id: m._id }, { $set: { timer, snooze: null } });
+  res.json({ ok: true, timer });
 });
 
 // check-ins
@@ -248,19 +337,137 @@ app.post('/api/checkins', auth, async (req, res) => {
   res.json({ ok: true });
 });
 
+// Per-medication check-ins ("How do you feel on this one?"), offered right after a dose is taken.
+app.get('/api/medcheckins', auth, async (req, res) => {
+  const q = { userId: req.userId };
+  if (req.query.medId) q.medId = String(oid(req.query.medId));
+  res.json(await medcheckins.find(q, { projection: { userId: 0 } }).sort({ at: -1 }).limit(Math.min(+req.query.limit || 20, 100)).toArray());
+});
+app.post('/api/medcheckins', auth, async (req, res) => {
+  const mood = +req.body.mood;
+  if (!(mood >= 1 && mood <= 5)) throw bad('Pick how you are feeling (1–5)');
+  const m = await meds.findOne({ _id: oid(req.body.medId), userId: req.userId });
+  if (!m) throw bad('Medication not found', 404);
+  const doc = { userId: req.userId, medId: String(m._id), medName: m.name, date: date(req.body.date), time: TIME.test(req.body.time) ? req.body.time : '',
+    mood, sideEffects: Array.isArray(req.body.sideEffects) ? req.body.sideEffects.filter(e => EFFECTS.includes(e)) : [],
+    notes: str(req.body.notes, 1000, 'Notes', false), at: new Date() };
+  const { insertedId } = await medcheckins.insertOne(doc);
+  res.status(201).json({ ...doc, _id: insertedId, userId: undefined });
+});
+
+// ---------- health log: measurements ----------
+const numIn = (v, min, max, name) => { const n = num(v, min, max, name); if (n == null) throw bad(`${name} is required`); return Math.round(n * 10) / 10; };
+app.get('/api/vitals', auth, async (req, res) => {
+  const days = Math.min(Math.max(+req.query.days || 90, 1), 730);
+  res.json(await vitals.find({ userId: req.userId, at: { $gte: new Date(Date.now() - days * 864e5) } }, { projection: { userId: 0 } }).sort({ at: -1 }).toArray());
+});
+app.post('/api/vitals', auth, async (req, res) => {
+  const b = req.body, type = b.type, V = VITALS[type];
+  if (!V) throw bad('Unknown measurement');
+  const doc = { userId: req.userId, type, value: numIn(b.value, V.min, V.max, type === 'bp' ? 'Top number (systolic)' : V.label) };
+  if (type === 'bp') { doc.value2 = numIn(b.value2, V.min2, V.max2, 'Bottom number (diastolic)'); doc.pulse = num(b.pulse, 30, 230, 'Pulse'); if (doc.value2 >= doc.value) throw bad('The top number should be bigger than the bottom one'); }
+  if (type === 'glucose') doc.context = GLUCOSE_CONTEXT.includes(b.context) ? b.context : 'other';
+  const at = b.at ? new Date(b.at) : new Date();
+  if (isNaN(at) || at > new Date(Date.now() + 5 * 60e3)) throw bad('Pick a time that isn’t in the future');
+  Object.assign(doc, { at, date: date(b.date, 'Date'), note: str(b.note, 300, 'Note', false), flag: vitalFlag(doc)?.level || null });
+  const { insertedId } = await vitals.insertOne(doc);
+  res.status(201).json({ ...doc, _id: insertedId, userId: undefined, flagText: vitalFlag(doc)?.text || '' });
+});
+app.delete('/api/vitals/:id', auth, async (req, res) => { await vitals.deleteOne({ _id: oid(req.params.id), userId: req.userId }); res.json({ ok: true }); });
+
+// ---------- health log: side effects in detail ----------
+// What study teams ask for: when it started and stopped, how bad (mild / moderate / severe), which medicine might
+// be the cause, and whether it was serious (ER visit, hospital stay, or a medicine stopped because of it).
+const SEVERITY = ['mild', 'moderate', 'severe'];
+async function effectInput(req) {
+  const b = req.body;
+  const suspects = Array.isArray(b.suspects) ? b.suspects.filter(ObjectId.isValid).slice(0, 6) : [];
+  const own = suspects.length ? await meds.find({ userId: req.userId }).toArray() : [];
+  const startDate = date(b.startDate, 'Start date'), endDate = b.endDate ? date(b.endDate, 'End date') : '';
+  if (endDate && endDate < startDate) throw bad('It can’t end before it started');
+  return {
+    name: str(b.name, 60, 'What you noticed'), startDate, endDate,
+    severity: SEVERITY.includes(b.severity) ? b.severity : 'mild',
+    serious: { er: !!b.serious?.er, hospital: !!b.serious?.hospital, stoppedMed: !!b.serious?.stoppedMed },
+    suspects: own.filter(m => suspects.includes(String(m._id))).map(m => ({ id: String(m._id), name: m.name, trialId: m.trialId || '' })),
+    notes: str(b.notes, 1000, 'Notes', false), updatedAt: new Date(),
+  };
+}
+const isSerious = e => e.severity === 'severe' || e.serious?.er || e.serious?.hospital;
+app.get('/api/effects', auth, async (req, res) => res.json(await effects.find({ userId: req.userId }, { projection: { userId: 0 } }).sort({ startDate: -1 }).limit(100).toArray()));
+app.post('/api/effects', auth, async (req, res) => {
+  const doc = { ...(await effectInput(req)), userId: req.userId, createdAt: new Date() };
+  const { insertedId } = await effects.insertOne(doc);
+  res.status(201).json({ ...doc, _id: insertedId, userId: undefined, serious: doc.serious, urgent: isSerious(doc) });
+});
+app.put('/api/effects/:id', auth, async (req, res) => {
+  const doc = await effectInput(req);
+  const r = await effects.findOneAndUpdate({ _id: oid(req.params.id), userId: req.userId }, { $set: doc }, { returnDocument: 'after' });
+  if (!r) throw bad('Not found', 404);
+  res.json({ ...r, userId: undefined, urgent: isSerious(r) });
+});
+app.delete('/api/effects/:id', auth, async (req, res) => { await effects.deleteOne({ _id: oid(req.params.id), userId: req.userId }); res.json({ ok: true }); });
+
+// ---------- profile: eligibility basics and the studies the user is in ----------
+const SEXES = ['female', 'male'];
+function profileInput(b = {}) {
+  const year = new Date().getFullYear();
+  const birthYear = b.birthYear === '' || b.birthYear == null ? null : num(b.birthYear, year - 120, year, 'Birth year');
+  return {
+    birthYear: birthYear && Math.round(birthYear), sex: SEXES.includes(b.sex) ? b.sex : '', location: str(b.location, 80, 'Location', false),
+    conditions: (Array.isArray(b.conditions) ? b.conditions : String(b.conditions || '').split(',')).map(c => String(c).trim()).filter(Boolean).slice(0, 12).map(c => c.slice(0, 60)),
+  };
+}
+function studyInput(b = {}) {
+  const nctId = str(b.nctId, 11, 'Study ID').toUpperCase();
+  if (!/^NCT\d{8}$/.test(nctId)) throw bad('Study IDs look like NCT12345678');
+  const visits = (Array.isArray(b.visits) ? b.visits : []).slice(0, 20).map(v => ({ date: date(v.date, 'Visit date'), time: TIME.test(v.time) ? v.time : '', label: str(v.label, 80, 'Visit', false) || 'Study visit' }))
+    .sort((a, c) => `${a.date} ${a.time}`.localeCompare(`${c.date} ${c.time}`));
+  const email = str(b.coordinatorEmail, 120, 'Email', false);
+  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw bad('That email doesn’t look right');
+  return { nctId, title: str(b.title, 300, 'Title', false), participantId: str(b.participantId, 40, 'Participant ID', false), site: str(b.site, 120, 'Study site', false),
+    coordinatorName: str(b.coordinatorName, 80, 'Coordinator', false), coordinatorPhone: str(b.coordinatorPhone, 30, 'Phone', false), coordinatorEmail: email, visits };
+}
+app.get('/api/profile', auth, async (req, res) => { const u = await users.findOne({ _id: req.userId }); res.json({ profile: u.profile || {}, studies: u.studies || [] }); });
+app.put('/api/profile', auth, async (req, res) => {
+  const set = {};
+  if (req.body.profile) set.profile = profileInput(req.body.profile);
+  if (Array.isArray(req.body.studies)) {
+    const list = req.body.studies.slice(0, 10).map(studyInput);
+    if (new Set(list.map(x => x.nctId)).size !== list.length) throw bad('That study is already listed');
+    set.studies = list;
+  }
+  await users.updateOne({ _id: req.userId }, { $set: set });
+  const u = await users.findOne({ _id: req.userId });
+  res.json({ profile: u.profile || {}, studies: u.studies || [] });
+});
+
 // clinician report
 async function reportFor(userId, q) {
   const today = date(q.today, 'today');
   const now = TIME.test(q.now) ? q.now : '23:59';
   const days = Math.min(Math.max(+q.days || 30, 1), 365);
   const from = addDays(today, -(days - 1));
-  const [u, m, d, c] = await Promise.all([
+  const [u, m, d, c, mc, vs, fx] = await Promise.all([
     users.findOne({ _id: userId }),
     meds.find({ userId, startDate: { $lte: today }, $or: [{ endDate: { $exists: false } }, { endDate: { $gte: from } }] }).toArray(),
     doses.find({ userId, date: { $gte: from, $lte: today } }).toArray(),
     checkins.find({ userId, date: { $gte: from, $lte: today } }).toArray(),
+    medcheckins.find({ userId, date: { $gte: from, $lte: today } }).sort({ at: -1 }).toArray(),
+    vitals.find({ userId, date: { $gte: from, $lte: today } }).toArray(),
+    effects.find({ userId, startDate: { $lte: today } }).sort({ startDate: -1 }).toArray(),
   ]);
-  return { patient: u.name, generatedAt: new Date(), ...buildReport({ meds: m, doses: d, checkins: c, today, now, days }) };
+  // Per-medication check-ins, grouped: average mood, side effects noted, latest few notes.
+  const medFeel = [...new Set(mc.map(x => x.medId))].map(id => {
+    const list = mc.filter(x => x.medId === id), fx = {};
+    list.forEach(x => x.sideEffects.forEach(e => (fx[e] = (fx[e] || 0) + 1)));
+    return { medId: id, name: list[0].medName, count: list.length, moodAvg: Math.round(list.reduce((a, x) => a + x.mood, 0) / list.length * 10) / 10,
+      sideEffects: Object.entries(fx).sort((a, b) => b[1] - a[1]).map(([name, count]) => ({ name, count })),
+      notes: list.filter(x => x.notes).slice(0, 3).map(x => ({ date: x.date, mood: x.mood, notes: x.notes })) };
+  });
+  const effectRows = fx.filter(e => !e.endDate || e.endDate >= from).map(({ userId: _, ...e }) => ({ ...e, urgent: isSerious(e) }));
+  return { patient: u.name, generatedAt: new Date(), ...buildReport({ meds: m, doses: d, checkins: c, today, now, days }), medFeel,
+    vitals: summarizeVitals(vs), effects: effectRows, profile: u.profile || {}, studies: u.studies || [] };
 }
 app.get('/api/report', auth, async (req, res) => res.json(await reportFor(req.userId, req.query)));
 
@@ -313,6 +520,7 @@ async function ndcLookup(ndc) {
 async function labelByWord(w) {
   return bestLabel((await fda('label', `openfda.brand_name:"${w}" openfda.generic_name:"${w}"`, 10))?.results, w) || null;
 }
+const STR_T = { type: 'STRING' };
 const withTimeout = (p, ms, fallback = null) => Promise.race([p, new Promise(ok => setTimeout(() => ok(fallback), ms))]);
 
 // ---------- RxNorm (NLM RxNav): spelling-tolerant matching to a standard drug ID ----------
@@ -497,7 +705,8 @@ async function recallsFor({ ndc, generic, lot }) {
 }
 
 // Label text that names another of the user's meds, both directions. Quotes the label; never judges severity.
-const interactionText = l => clip(first(l?.drug_interactions) || '', 4000);
+// Rx labels have a drug interactions section; OTC labels put the same warnings under "Ask a doctor or pharmacist" / "Do not use".
+const interactionText = l => clip([first(l?.drug_interactions), first(l?.ask_doctor_or_pharmacist), first(l?.do_not_use), first(l?.contraindications)].filter(Boolean).join(' '), 6000);
 async function interactionsFor(userId, { generic, brand, ingredients }) {
   const newName = titleCase(ingredients[0]?.name || generic || brand || '');
   const newNames = [...new Set([...ingredients.map(i => i.name), generic, brand].filter(Boolean))];
@@ -518,55 +727,218 @@ async function interactionsFor(userId, { generic, brand, ingredients }) {
   return out;
 }
 
+// ---------- dose intervals ----------
+// How long between doses of this med, for its timer. Order: the user's own number, then Pip (Gemini) reading the user's
+// directions, reminder times and the FDA label's dosing, then the directions parsed by rule, then the reminder times.
+function fallbackInterval(m) {
+  const h = hoursFromDirections(m.instructions);
+  return h ? { hours: h, by: 'directions', basis: `Your directions: “${m.instructions}”` } : { hours: scheduleHours(m.times), by: 'schedule', basis: `${m.times.length === 1 ? 'Once' : `${m.times.length} times`} a day, from your reminder times` };
+}
+const INTERVAL_SCHEMA = { type: 'OBJECT', required: ['hours', 'basis'], properties: { hours: { type: 'NUMBER' }, basis: STR_T, from: STR_T } };
+async function intervalFor(m, aiOk) {
+  if (m.intervalHours) return { hours: m.intervalHours, by: 'you', basis: 'You set this' };
+  if (GEMINI_KEY && aiOk) {
+    try {
+      const w = (m.ingredients?.[0]?.name || m.name).toUpperCase().replace(/[^A-Z0-9 -]/g, ' ').trim();
+      const label = await withTimeout(lookupDrug({ ndc: [], words: [w] }).catch(() => null), 6000);
+      const o = await withTimeout(ask(`A patient tracks this medicine in PillPal.
+Name: ${m.name}${label?.generic ? ` (${label.generic})` : ''}. Dose: ${m.dose || 'not given'}. Their directions: ${m.instructions || 'none written'}. Their reminder times: ${m.times.join(', ')}.
+FDA label dosing excerpt: ${label?.dosage || 'not available'}
+How many hours should pass between doses for THIS patient? Their own written directions come first ("every 6 hours" = 6, "twice daily" = 12, "once daily" = 24, "once weekly" = 168). If they don't say, use how many reminder times they set per day, then the label's usual adult dosing. Never pick a shorter gap than the label allows.
+Return JSON: {"hours": number, "basis": "under 14 words: what this is based on", "from": "your directions" | "your reminder times" | "the FDA label"}`,
+        { json: true, schema: INTERVAL_SCHEMA, models: [[GEMINI_MODEL, 'low'], ['gemini-3.6-flash', 'low'], [FAST_MODEL, 'low']] }), 15000);
+      const hours = Math.round(+o?.hours * 4) / 4;
+      if (hours >= 0.5 && hours <= 168) return { hours, by: 'pip', basis: s(o.basis, 140) || 'Pip read your directions and the FDA label', from: s(o.from, 40) };
+    } catch (e) { console.error('interval: Pip could not work it out:', e.message); }
+  }
+  return fallbackInterval(m);
+}
+// Works out intervals for any of the user's meds that don't have one yet (new, edited, or saved before timers existed).
+app.post('/api/meds/intervals', auth, async (req, res) => {
+  const u = await users.findOne({ _id: req.userId });
+  const list = await meds.find({ userId: req.userId, active: true }).toArray();
+  await Promise.all(list.filter(m => !m.interval?.hours).map(async m => {
+    m.interval = { ...(await intervalFor(m, !u.prefs?.noAi && !u.demo)), at: new Date() };
+    await meds.updateOne({ _id: m._id }, { $set: { interval: m.interval } });
+  }));
+  res.json(list.map(m => ({ id: String(m._id), interval: m.interval })));
+});
+
+// Pip's mix check: every pair of the user's active meds where one label names the other (or its drug class).
+// Quotes the label and keeps its own wording's strength (avoid vs. caution); Pip never decides beyond that.
+const mixCache = new Map(); // ponytail: in-memory, per process
+app.get('/api/meds/mixes', auth, async (req, res) => {
+  if ((await users.findOne({ _id: req.userId }))?.demo) return res.json(demoMixes(await meds.find({ userId: req.userId, active: true }).toArray()));
+  const list = await activeMedsWithIngredients(req.userId);
+  const seen = new Set();
+  const uniq = list.filter(m => { const k = m.ingredients?.length ? m.ingredients.map(i => i.rxcui).sort().join('+') : m.name.toLowerCase(); return !seen.has(k) && seen.add(k); }).slice(0, 10);
+  const word = m => (m.ingredients?.[0]?.name || m.name).toUpperCase();
+  const labels = await Promise.all(uniq.map(m => withTimeout(labelByWord(word(m)).catch(() => null), 10000)));
+  const names = uniq.map(m => mixNames(m.name, (m.ingredients || []).map(i => i.name)));
+  const pairs = [];
+  for (let i = 0; i < uniq.length; i++) for (let j = i + 1; j < uniq.length; j++) {
+    const fwd = mentionsOf(interactionText(labels[i]), names[j])[0], back = !fwd && mentionsOf(interactionText(labels[j]), names[i])[0];
+    const hit = fwd || back;
+    if (!hit) continue;
+    const [by, other] = fwd ? [uniq[i], uniq[j]] : [uniq[j], uniq[i]];
+    pairs.push({ a: { id: String(uniq[i]._id), name: uniq[i].name }, b: { id: String(uniq[j]._id), name: uniq[j].name },
+      labelOf: by.name, mentions: other.name, term: hit.name, snippet: hit.snippet, level: mixLevel(hit.snippet) });
+  }
+  pairs.sort((x, y) => (x.level === 'avoid' ? 0 : 1) - (y.level === 'avoid' ? 0 : 1));
+  // Pip rewords each label quote in plain words (one Gemini call, cached). The label quote always stays alongside.
+  const u = pairs.length && GEMINI_KEY ? await users.findOne({ _id: req.userId }) : null;
+  if (u && !u.prefs?.noAi) {
+    const key = pairs.map(p => `${p.labelOf}|${p.mentions}|${p.snippet}`).join('\n');
+    let plain = mixCache.get(key);
+    if (!plain) {
+      plain = await withTimeout(ask(`For each numbered pair, write ONE short plain-language sentence (under 25 words) saying what this FDA label text warns could happen when the two are taken together. Only restate the label; never tell anyone to stop, skip or change a medicine.
+${pairs.map((p, i) => `${i + 1}. ${p.labelOf} + ${p.mentions}. Label text: "${p.snippet}"`).join('\n')}
+Return JSON: {"plain": ["sentence for pair 1", "..."]}`, { json: true, models: [[GEMINI_MODEL, 'low'], ['gemini-3.6-flash', 'low'], [FAST_MODEL, 'low']] }).then(o => arr(o.plain)).catch(() => null), 9000);
+      if (plain?.length === pairs.length) { if (mixCache.size > 200) mixCache.clear(); mixCache.set(key, plain); }
+    }
+    if (plain?.length === pairs.length) pairs.forEach((p, i) => (p.plain = plain[i]));
+  }
+  res.json({ pairs, checked: uniq.length });
+});
+
+// ---------- ClinicalTrials.gov ----------
+// Its firewall turns away some HTTP clients by their TLS fingerprint, so: Node's fetch first, then node:https.
+// If both are refused, the browser is told to call the API itself (a real browser gets through) and is always
+// given a working ClinicalTrials.gov website link for the same search.
+const CT_HEADERS = { Accept: 'application/json', 'User-Agent': 'PillPal/1.0 (medication tracker)' };
+function httpsJson(url) {
+  return new Promise((ok, fail) => {
+    const r = https.get(url, { headers: CT_HEADERS, timeout: 10000 }, res => {
+      let body = '';
+      res.setEncoding('utf8');
+      res.on('data', c => (body += c));
+      res.on('end', () => {
+        if (res.statusCode === 404) return ok(null);
+        if (res.statusCode >= 400) return fail(Object.assign(new Error(`ClinicalTrials.gov answered ${res.statusCode}`), { status: res.statusCode }));
+        try { ok(JSON.parse(body)); } catch { fail(new Error('ClinicalTrials.gov sent something that isn’t JSON')); }
+      });
+    });
+    r.on('timeout', () => r.destroy(new Error('ClinicalTrials.gov timed out')));
+    r.on('error', fail);
+  });
+}
+async function ctgov(path) {
+  const url = 'https://clinicaltrials.gov/api/v2' + path;
+  if (cache.has(url)) return cache.get(url);
+  let data;
+  try {
+    const r = await fetch(url, { headers: CT_HEADERS, signal: AbortSignal.timeout(10000) });
+    if (r.status === 404) data = null;
+    else if (!r.ok) throw new Error(`answered ${r.status}`);
+    else data = await r.json();
+  } catch (e) {
+    console.error(`ClinicalTrials.gov via fetch failed (${e.message}); retrying with node:https`);
+    data = await httpsJson(url);
+  }
+  if (cache.size > 500) cache.clear();
+  cache.set(url, data);
+  return data;
+}
+const ageOf = p => (p?.birthYear ? new Date().getFullYear() - p.birthYear : null);
 app.get('/api/trials', auth, async (req, res) => {
   const cond = clean(req.query.cond), intr = clean(req.query.intr), loc = clean(req.query.loc);
   if (!cond && !intr) throw bad('Enter a condition or a medication');
-  const p = new URLSearchParams({
-    'filter.overallStatus': 'RECRUITING', pageSize: '12',
-    fields: 'NCTId,BriefTitle,Condition,Phase,BriefSummary,LocationCity,LocationState,LocationCountry,LeadSponsorName',
-  });
+  const p = new URLSearchParams({ 'filter.overallStatus': 'RECRUITING', pageSize: '12', fields: STUDY_FIELDS });
   if (cond) p.set('query.cond', cond);
   if (intr) p.set('query.intr', intr);
   if (loc) p.set('query.locn', loc);
-  const data = await cachedJson('https://clinicaltrials.gov/api/v2/studies?' + p);
-  const near = loc.toLowerCase();
-  res.json((data?.studies || []).map(s => {
-    const ps = s.protocolSection || {};
-    const locs = [...new Set((ps.contactsLocationsModule?.locations || []).map(l => [l.city, l.state || l.country].filter(Boolean).join(', ')))];
-    return {
-      id: ps.identificationModule?.nctId,
-      title: ps.identificationModule?.briefTitle,
-      conditions: (ps.conditionsModule?.conditions || []).slice(0, 4),
-      phases: ps.designModule?.phases || [],
-      sponsor: ps.sponsorCollaboratorsModule?.leadSponsor?.name || '',
-      summary: clip(ps.descriptionModule?.briefSummary || '', 260),
-      locationCount: locs.length,
-      locations: (near ? [...locs.filter(l => l.toLowerCase().includes(near)), ...locs.filter(l => !l.toLowerCase().includes(near))] : locs).slice(0, 3),
-    };
-  }));
+  const searchUrl = ctgovSearchUrl({ cond, intr, loc }), profile = (await users.findOne({ _id: req.userId })).profile || {};
+  try {
+    const data = await ctgov('/studies?' + p);
+    const studies = (data?.studies || []).map(x => mapStudy(x, loc)).filter(t => t.id).map(t => ({ ...t, fit: quickFit(t, { age: ageOf(profile), sex: profile.sex }) }));
+    res.json({ studies, searchUrl });
+  } catch (e) {
+    console.error('ClinicalTrials.gov search failed:', e.message);
+    res.json({ blocked: true, apiUrl: 'https://clinicaltrials.gov/api/v2/studies?' + p, searchUrl, profile: { age: ageOf(profile), sex: profile.sex } });
+  }
+});
+// One study, to check an ID and show its title and status (meds with a trial ID, My studies).
+app.get('/api/trials/:id', auth, async (req, res) => {
+  const id = String(req.params.id).toUpperCase();
+  if (!/^NCT\d{8}$/.test(id)) throw bad('Study IDs look like NCT12345678');
+  const url = `https://clinicaltrials.gov/study/${id}`;
+  try {
+    const data = await ctgov(`/studies/${id}?fields=${STUDY_FIELDS}`);
+    res.json(data ? { found: true, url, ...mapStudy(data) } : { found: false, id, url });
+  } catch (e) { res.json({ blocked: true, id, url, apiUrl: `https://clinicaltrials.gov/api/v2/studies/${id}?fields=${STUDY_FIELDS}` }); }
+});
+// Pip's pre-check: the study's eligibility criteria against the user's profile, meds and measurements.
+// Says "likely / maybe / unlikely" with reasons; the study team always decides.
+app.post('/api/trials/:id/precheck', auth, async (req, res) => {
+  const id = String(req.params.id).toUpperCase();
+  if ((await users.findOne({ _id: req.userId }))?.demo) return res.json(demoPrecheck(id, { title: s(req.body.title, 200) }));
+  const u = await aiUser(req);
+  if (!/^NCT\d{8}$/.test(id)) throw bad('Study IDs look like NCT12345678');
+  let t = null;
+  try { const d = await ctgov(`/studies/${id}?fields=${STUDY_FIELDS}`); t = d && mapStudy(d); } catch { /* fall back to what the browser sent */ }
+  const criteria = t?.criteria || str(req.body.criteria, 6000, 'Criteria', false);
+  if (!criteria) throw bad('Couldn’t load this study’s eligibility rules right now.');
+  const r = await reportFor(u._id, { today: req.body.today, now: req.body.now, days: 30 }), p = u.profile || {};
+  const list = await meds.find({ userId: u._id, active: true }).toArray();
+  const about = [`Age: ${ageOf(p) ?? 'unknown'}`, `Sex: ${p.sex || 'unknown'}`, `Conditions: ${p.conditions?.join(', ') || 'not given'}`,
+    `Medications: ${list.map(m => `${m.name}${m.dose ? ' ' + m.dose : ''}`).join(', ') || 'none'}`,
+    `Recent measurements: ${r.vitals.map(v => `${v.label} ${vitalText(v.latest)} ${v.unit}`).join('; ') || 'none'}`].join('\n');
+  const o = await ask(`A patient is curious whether they might qualify for clinical trial ${id}${t?.title ? ` ("${t.title}")` : ''}.
+Study eligibility criteria:\n${criteria.slice(0, 5000)}\n\nWhat PillPal knows about the patient:\n${about}
+Compare them. Only use the facts given; when something isn't known, list it as a question for the study team instead of guessing.
+Return JSON: {"verdict": "likely" | "maybe" | "unlikely", "summary": "one plain sentence", "matches": ["up to 3 criteria they appear to meet"], "concerns": ["up to 3 criteria that may rule them out"], "ask": ["up to 3 things to ask or check with the study team"]}`,
+    { json: true, models: [[GEMINI_MODEL, 'low'], ['gemini-3.6-flash', 'low'], [FAST_MODEL, 'low']] });
+  res.json({ verdict: ['likely', 'maybe', 'unlikely'].includes(o.verdict) ? o.verdict : 'maybe', summary: s(o.summary, 300), matches: arr(o.matches), concerns: arr(o.concerns), ask: arr(o.ask) });
+});
+// "Send to my study team": doses of the study medicine, side effects in detail, measurements and notes, as plain text.
+app.get('/api/study-summary', auth, async (req, res) => {
+  const u = await users.findOne({ _id: req.userId }), nct = String(req.query.nct || '').toUpperCase();
+  const st = (u.studies || []).find(x => x.nctId === nct) || { nctId: nct };
+  const days = Math.min(Math.max(+req.query.days || 30, 1), 365);
+  const r = await reportFor(u._id, { today: req.query.today, now: req.query.now, days });
+  const studyMeds = r.meds.filter(m => m.trialId === nct);
+  const L = [`PillPal update for study ${nct}${st.title ? ` (${st.title})` : ''}`, `Participant: ${u.name}${st.participantId ? `, ID ${st.participantId}` : ''}`,
+    `Period: ${r.from} to ${r.to} (${days} days)`, ''];
+  L.push('Study medication:', ...(studyMeds.length ? studyMeds.map(m => `- ${m.name}${m.dose ? ' ' + m.dose : ''}: ${m.adherence ?? 'n/a'}% of doses taken (${m.taken}/${m.scheduled}), ${m.missed} missed, ${m.skipped} skipped${m.recentMissed.length ? `; last missed ${m.recentMissed.slice(-2).join(', ')}` : ''}`) : ['- No medication in PillPal is linked to this study ID.']));
+  L.push('', `Other medications: ${r.meds.filter(m => m.trialId !== nct && m.active).map(m => `${m.name}${m.dose ? ' ' + m.dose : ''}`).join(', ') || 'none'}`);
+  L.push('', 'Side effects (adverse events):', ...(r.effects.length ? r.effects.map(e => `- ${e.name}: ${e.severity}, started ${e.startDate}, ${e.endDate ? `ended ${e.endDate}` : 'ongoing'}${e.suspects.length ? `; possibly from ${e.suspects.map(x => x.name).join(', ')}` : ''}${e.serious.er ? '; ER visit' : ''}${e.serious.hospital ? '; hospital stay' : ''}${e.serious.stoppedMed ? '; a medicine was stopped' : ''}${e.notes ? `. "${e.notes}"` : ''}`) : ['- None reported in detail.']));
+  if (r.sideEffects.length) L.push(`Daily check-ins also noted: ${r.sideEffects.map(x => `${x.name} (${x.count} days)`).join(', ')}`);
+  L.push('', 'Measurements:', ...(r.vitals.length ? r.vitals.map(v => `- ${v.label}: latest ${vitalText(v.latest)} ${v.unit} on ${v.latest.date}; average ${v.avg}${v.avg2 ? '/' + v.avg2 : ''}; range ${v.min} to ${v.max}; ${v.count} readings${v.flagged ? `, ${v.flagged} outside the usual range` : ''}`) : ['- None logged.']));
+  const notes = r.notes.slice(0, 5);
+  if (notes.length) L.push('', 'Notes and questions:', ...notes.map(n => `- ${n.date}: ${[n.notes, n.questions && 'Question: ' + n.questions].filter(Boolean).join(' / ')}`));
+  L.push('', 'Self-reported by the participant with PillPal. Not a medical record.');
+  res.json({ text: L.join('\n'), subject: `PillPal update: ${nct}${st.participantId ? ` (participant ${st.participantId})` : ''}`, email: st.coordinatorEmail || '' });
 });
 
 // ---------- Gemini: Pip's AI (scan vision, chat, explainers, insights, visit prep) ----------
 const PAL_RULES = `You are Pip, the friendly capsule mascot of PillPal, a medication tracking app. Be warm, plain (6th-grade reading level) and brief: usually under 120 words.
+Be genuinely helpful, like a knowledgeable pharmacist friend:
+- Answer the actual question first, in the first sentence. Don't greet, don't introduce yourself, don't open with what you can't do.
+- Questions like "can I take X with my meds?" deserve a real answer: say what is known about combining them (for example "There's no known interaction between ibuprofen and cetirizine"), what the FDA labels warn about, and the practical cautions that matter (stomach, kidneys, blood pressure, drowsiness, alcohol, max daily dose on the label). Name the specific meds involved.
+- Check their list for doubles: two products with the same active ingredient (a brand and its generic, or a store brand like "All Day Allergy" that is cetirizine). Point it out clearly, since taking both doubles the dose.
+- End with at most one short line about checking with their pharmacist when it really depends on their health (kidney or stomach problems, pregnancy, other conditions). Don't hide the answer behind that line.
 Rules you never break:
-- You are not a doctor or pharmacist. Never diagnose. Never tell someone to start, stop, skip, double, split or change a dose; send those questions to their prescriber or pharmacist.
+- You are not a doctor. Never diagnose. Never tell someone to start, stop, skip, double, split or change a prescribed dose; for those decisions say to ask their prescriber or pharmacist. Sharing well-established facts about medicines and the label's own directions is fine.
 - If the user describes an emergency (chest pain, trouble breathing, swelling of face or throat, fainting, seizure, possible overdose, thoughts of self-harm), FIRST tell them to call 911 now (Poison Help 1-800-222-1222 for overdose or poisoning, 988 for a mental health crisis).
-- General facts about medicines are fine. Ground them in the FDA label excerpts you are given, and say plainly when you are unsure or when it depends on the person.
+- Ground facts in the FDA label excerpts and ingredient lists you are given plus well-established pharmacology. Say plainly when something is uncertain.
 - Only use the user's data you are given. Never invent doses, times or history.
 - Plain text. Short paragraphs or simple "- " bullets. No headings, no tables, no emoji.`;
 
-// Busy/overloaded (429/5xx): retry once, then fall back to an older stable model.
-// Model + how much it "thinks" before answering. Thinking adds seconds; reading a label or a short explainer needs little.
-// Gemini 3+ takes thinkingLevel; 2.5 models take thinkingBudget (0 = off on 2.5 Flash).
-const MODELS = [GEMINI_MODEL, GEMINI_MODEL, 'gemini-2.5-flash'];
-// Scanning: the fast Flash-Lite model first (Google's pick for high-throughput reading), then the main model with low thinking.
-const SCAN_MODELS = [[process.env.GEMINI_SCAN_MODEL || 'gemini-3.5-flash-lite', 'minimal'], [GEMINI_MODEL, 'low'], [GEMINI_MODEL, 'low'], ['gemini-2.5-flash', 'low']];
-const thinkingFor = (model, level) => !level ? null : /2\.5/.test(model) ? { thinkingBudget: /pro/.test(model) ? 128 : 0 } : { thinkingLevel: level };
-async function gemini({ system = PAL_RULES, contents, json = false, temperature = 0.5, schema = null, models = null }) {
-  const plan = models || MODELS.map(m => [m, null]);
-  let r, data, i = 0, noThinking = false;
+// Which model answers, and how much it "thinks" first (thinking adds seconds; reading a label needs little).
+// Busy (429/5xx) or not available to this key (403/404): retry once, then the next model in the plan.
+// Gemini 3.6+ ignores temperature/top_p/top_k and newer models reject them, so none are sent.
+const MODELS = [[GEMINI_MODEL, 'low'], [GEMINI_MODEL, 'low'], ['gemini-3.6-flash', 'low'], [FAST_MODEL, 'minimal']];
+const SCAN_MODELS = [[FAST_MODEL, 'minimal'], [GEMINI_MODEL, 'low'], [GEMINI_MODEL, 'low'], ['gemini-3.6-flash', 'low']];
+const thinkingFor = (model, level) => !level ? null : /2\.5/.test(model) ? { thinkingBudget: /pro/.test(model) ? 128 : 0 }
+  : { thinkingLevel: level === 'minimal' && /3\.8|pro/.test(model) ? 'low' : level }; // 3.8 Flash has no "minimal"
+// Last result, shown in Settings and the server log, so a bad key or model is easy to spot.
+const aiStatus = { ok: null, model: GEMINI_MODEL, error: '', at: null };
+const keyProblem = (status, msg) => status === 401 || /api[ _-]?key|unauthenticated|access_token|credential|permission denied/i.test(msg) && [400, 401, 403].includes(status);
+async function gemini({ system = PAL_RULES, contents, json = false, schema = null, models = null }) {
+  const plan = models || MODELS;
+  let r, data, i = 0, noThinking = false, plain = false;
   while (i < plan.length) {
-    const [model, level] = plan[i], thinking = noThinking ? null : thinkingFor(model, level);
+    const [model, level] = plan[i], thinking = noThinking || plain ? null : thinkingFor(model, level), sch = plain ? null : schema;
     r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`, {
       method: 'POST',
       signal: AbortSignal.timeout(45000),
@@ -574,30 +946,145 @@ async function gemini({ system = PAL_RULES, contents, json = false, temperature 
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: system }] },
         contents,
-        generationConfig: { temperature, ...(json && { responseMimeType: 'application/json' }), ...(schema && { responseSchema: schema }), ...(thinking && { thinkingConfig: thinking }) },
+        generationConfig: { ...(json && { responseMimeType: 'application/json' }), ...(sch && { responseSchema: sch }), ...(thinking && { thinkingConfig: thinking }) },
       }),
-    });
+    }).catch(e => ({ ok: false, status: 0, json: async () => ({ error: { message: `Couldn't reach Google: ${e.message}` } }) }));
     data = await r.json().catch(() => ({}));
-    if (r.ok) break;
+    if (r.ok) { Object.assign(aiStatus, { ok: true, model, error: '', at: new Date() }); break; }
     const msg = data.error?.message || '';
-    // Settings a model rejects (400) shouldn't break anything: drop them and ask the same model again.
-    if (r.status === 400 && thinking && /think/i.test(msg)) { console.error('Gemini thinking setting rejected, retrying without it:', msg); noThinking = true; continue; }
-    if (r.status === 400 && schema) { console.error('Gemini schema rejected, retrying without it:', msg); schema = null; continue; }
-    // Model not available to this key (404/403) or busy (429/5xx): move on to the next model in the plan.
-    if (![403, 404, 429].includes(r.status) && r.status < 500) break;
-    console.error('Gemini unavailable/busy', model, r.status, msg);
-    i++;
+    console.error(`Gemini ${model} → ${r.status}: ${msg}`);
+    if (keyProblem(r.status, msg)) {
+      Object.assign(aiStatus, { ok: false, model, error: `Google didn't accept the API key: ${msg}`, at: new Date() });
+      throw bad("Pip's AI can't sign in to Google: the Gemini API key was rejected. Check GEMINI_API_KEY in .env.", 502);
+    }
+    // A setting this model rejects (400): drop the optional extras (thinking, schema) and ask the same model again.
+    if (r.status === 400 && thinking && /think/i.test(msg)) { noThinking = true; continue; }
+    if (r.status === 400 && !plain && (thinking || sch)) { plain = true; continue; }
+    // Not available to this key, busy, or still a 400: move on to the next model in the plan.
+    Object.assign(aiStatus, { ok: false, model, error: `${model}: ${r.status} ${msg}`.trim(), at: new Date() });
+    i++; plain = false; noThinking = false;
     if (i < plan.length && plan[i][0] === model) await new Promise(ok => setTimeout(ok, 800));
   }
-  if (!r.ok) {
-    console.error('Gemini error', r.status, data.error?.message);
-    throw bad(r.status === 429 ? 'Pip is answering a lot of questions right now. Try again in a minute.' : "Pip's AI is unavailable right now.", 502);
-  }
+  if (!r.ok) throw bad(r.status === 429 ? 'Pip is answering a lot of questions right now. Try again in a minute.' : "Pip's AI is unavailable right now.", 502);
   const text = (data.candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('').trim();
   if (!text) throw bad("Pip couldn't answer that one. Try asking another way.", 502);
   if (!json) return text;
-  try { return JSON.parse(text); } catch { throw bad('Pip got muddled reading that. Please try again.', 502); }
+  try { return JSON.parse(text.replace(/^```(?:json)?\s*|\s*```$/g, '')); } catch { throw bad('Pip got muddled reading that. Please try again.', 502); }
 }
+// Same model plan and error handling as gemini(), but streams text pieces to onText as they arrive.
+// Falls back to the next model only if nothing has been sent yet.
+async function geminiStream({ system = PAL_RULES, contents, models }, onText) {
+  let i = 0, noThinking = false, sent = false, lastErr = '', lastStatus = 0;
+  while (i < models.length) {
+    const [model, level] = models[i], thinking = noThinking ? null : thinkingFor(model, level);
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`, {
+      method: 'POST', signal: AbortSignal.timeout(45000),
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_KEY },
+      body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents, generationConfig: { ...(thinking && { thinkingConfig: thinking }) } }),
+    }).catch(e => ({ ok: false, status: 0, json: async () => ({ error: { message: `Couldn't reach Google: ${e.message}` } }) }));
+    if (!r.ok) {
+      const msg = (await r.json().catch(() => ({}))).error?.message || '';
+      console.error(`Gemini ${model} (stream) → ${r.status}: ${msg}`);
+      if (keyProblem(r.status, msg)) {
+        Object.assign(aiStatus, { ok: false, model, error: `Google didn't accept the API key: ${msg}`, at: new Date() });
+        throw bad("Pip's AI can't sign in to Google: the Gemini API key was rejected. Check GEMINI_API_KEY in .env.", 502);
+      }
+      if (r.status === 400 && thinking) { noThinking = true; continue; }
+      lastErr = msg; lastStatus = r.status; i++; noThinking = false;
+      continue;
+    }
+    Object.assign(aiStatus, { ok: true, model, error: '', at: new Date() });
+    const reader = r.body.getReader(), dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let k;
+      while ((k = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, k).trim(); buf = buf.slice(k + 1);
+        if (!line.startsWith('data:')) continue;
+        try {
+          const t = (JSON.parse(line.slice(5)).candidates?.[0]?.content?.parts || []).filter(p => !p.thought).map(p => p.text || '').join('');
+          if (t) { sent = true; onText(t); }
+        } catch { /* partial or keep-alive line */ }
+      }
+    }
+    if (sent) return;
+    lastErr = 'empty reply'; i++;
+  }
+  Object.assign(aiStatus, { ok: false, error: lastErr, at: new Date() });
+  throw bad(lastStatus === 429 ? 'Pip is answering a lot of questions right now. Try again in a minute.' : "Pip's AI is unavailable right now.", 502);
+}
+// At startup: is the key accepted, and can it use the model? Logged, and shown in Settings.
+async function checkGemini() {
+  if (!GEMINI_KEY) return console.log('Gemini: no GEMINI_API_KEY set, so AI features are off.');
+  try {
+    const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}`, { headers: { 'x-goog-api-key': GEMINI_KEY }, signal: AbortSignal.timeout(10000) });
+    const d = await r.json().catch(() => ({}));
+    Object.assign(aiStatus, r.ok ? { ok: true, error: '' } : { ok: false, error: keyProblem(r.status, d.error?.message || '') ? `Google didn't accept the API key: ${d.error?.message}` : `${GEMINI_MODEL}: ${r.status} ${d.error?.message || ''}` }, { at: new Date() });
+    console.log(r.ok ? `Gemini: key works, using ${GEMINI_MODEL} (fast reads: ${FAST_MODEL}).` : `Gemini check FAILED: ${aiStatus.error}`);
+  } catch (e) { Object.assign(aiStatus, { ok: false, error: `Couldn't reach Google: ${e.message}`, at: new Date() }); console.log(`Gemini check FAILED: ${aiStatus.error}`); }
+}
+app.get('/api/ai/status', auth, (req, res) => res.json({ configured: !!GEMINI_KEY, ...aiStatus }));
+
+// ---------- demo mode ----------
+// A separate, throwaway account filled with a 60-day showcase story (demo.js). Pip's answers there are pre-written,
+// so a presentation never waits on, or depends on, Gemini. Demo accounts older than a day are tidied away.
+const userColls = () => [meds, doses, checkins, medcheckins, scanfixes, vitals, effects];
+async function seedDemo(userId, b) {
+  await Promise.all(userColls().map(c => c.deleteMany({ userId })));
+  const today = date(b.today, 'today'), now = TIME.test(b.now) ? b.now : '12:00', tz = Number.isFinite(+b.tz) && Math.abs(+b.tz) <= 840 ? +b.tz : 0;
+  const d = buildDemo({ today, now, tz });
+  const ids = [], byKey = {};
+  for (const { key, ...m } of d.meds) { const id = (await meds.insertOne({ ...m, userId })).insertedId; ids.push(id); byKey[key] = { id: String(id), name: m.name, trialId: m.trialId }; }
+  await Promise.all([
+    doses.insertMany(d.doses.map(({ mi, ...x }) => ({ ...x, userId, medId: String(ids[mi]) }))),
+    checkins.insertMany(d.checkins.map(c => ({ ...c, userId }))),
+    medcheckins.insertMany(d.medcheckins.map(({ mi, ...c }) => ({ ...c, userId, medId: String(ids[mi]) }))),
+    vitals.insertMany(d.vitals.map(v => ({ ...v, note: v.note || '', userId, flag: vitalFlag(v)?.level || null }))),
+    effects.insertMany(d.effects.map(e => ({ ...e, suspects: e.suspects.map(k => byKey[k]).filter(Boolean), userId, createdAt: new Date(), updatedAt: new Date() }))),
+    users.updateOne({ _id: userId }, { $set: { profile: d.profile, studies: d.studies } }),
+  ]);
+  ctxCache.delete(String(userId));
+}
+app.post('/api/demo/start', async (req, res) => {
+  for (const u of await users.find({ demo: true, createdAt: { $lt: new Date(Date.now() - 864e5) } }).toArray()) {
+    await Promise.all([...userColls(), sessions].map(c => c.deleteMany({ userId: u._id })));
+    await users.deleteOne({ _id: u._id });
+  }
+  const { insertedId } = await users.insertOne({ name: 'Denise', email: `demo-${crypto.randomBytes(6).toString('hex')}@demo.pillpal`, passHash: '', demo: true, prefs: {}, createdAt: new Date() });
+  await seedDemo(insertedId, req.body);
+  await startSession(res, insertedId);
+  res.status(201).json(publicUser(await users.findOne({ _id: insertedId })));
+});
+app.post('/api/demo/reset', auth, async (req, res) => {
+  const u = await users.findOne({ _id: req.userId });
+  if (!u?.demo) throw bad('Only demo accounts can be reset', 403);
+  await seedDemo(u._id, req.body);
+  res.json({ ok: true });
+});
+// Demo accounts: Pip's AI features answer from demo.js (label scanning still reads the photo for real).
+app.use('/api/ai', auth, async (req, res, next) => {
+  if (req.method !== 'POST' || req.path === '/scan') return next();
+  const u = await users.findOne({ _id: req.userId });
+  if (!u?.demo) return next();
+  const q = req.body || {}, week = () => reportFor(u._id, { ...q, days: 7 });
+  if (req.path === '/warm') return res.json({ ok: true });
+  if (req.path === '/chat' || req.path === '/chat/stream') {
+    const { contents, urgent } = chatInput(req);
+    const reply = urgent ? SAFETY : demoChat(contents.at(-1).parts[0].text, await week(), await meds.find({ userId: u._id, active: true }).toArray());
+    if (req.path === '/chat') return res.json({ reply, urgent });
+    res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', 'X-Accel-Buffering': 'no' });
+    for (const w of reply.split(/(?<=\s)/)) { res.write(`data: ${JSON.stringify({ t: w, urgent })}\n\n`); await new Promise(ok => setTimeout(ok, 16)); }
+    res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
+    return res.end();
+  }
+  if (req.path === '/explain') return res.json(demoExplain(clean(q.name)));
+  if (req.path === '/insight') return res.json({ note: demoInsight(await week()) });
+  if (req.path === '/visit-prep') return res.json(demoVisitPrep(await reportFor(u._id, q)));
+  next();
+});
 const ask = (prompt, opts = {}) => gemini({ ...opts, contents: [{ role: 'user', parts: [{ text: prompt }] }] });
 const s = (v, n = 200) => String(v ?? '').trim().slice(0, n);
 const arr = v => (Array.isArray(v) ? v.map(x => s(x, 300)).filter(Boolean).slice(0, 6) : []);
@@ -622,36 +1109,65 @@ async function labelFacts(name) {
 }
 
 async function patientContext(u, q, { labels = true } = {}) {
-  const [list, r] = await Promise.all([meds.find({ userId: u._id, active: true }).toArray(), reportFor(u._id, { ...q, days: 7 })]);
-  const facts = labels ? (await Promise.all(list.slice(0, 6).map(m => labelFacts(m.name)))).filter(Boolean) : [];
+  const [list, r, feel] = await Promise.all([withTimeout(activeMedsWithIngredients(u._id), 3000).then(l => l || meds.find({ userId: u._id, active: true }).toArray()), reportFor(u._id, { ...q, days: 7 }),
+    medcheckins.find({ userId: u._id }).sort({ at: -1 }).limit(6).toArray()]);
+  // Label lookups are cached after the first time; a slow FDA/RxNorm reply is skipped rather than holding up Pip.
+  const facts = labels ? (await Promise.all(list.slice(0, 6).map(m => withTimeout(labelFacts(m.name).catch(() => ''), 2500, '')))).filter(Boolean) : [];
   return [
     `First name: ${u.name}. Today: ${r.to}, local time ${TIME.test(q.now) ? q.now : 'unknown'}.`,
-    `Current medications: ${list.map(m => `${m.name}${m.dose ? ' ' + m.dose : ''} at ${m.times.join(', ')}${m.reason ? ` for ${m.reason}` : ''}${m.instructions ? ` (${m.instructions})` : ''}${m.trialId ? ` [clinical trial ${m.trialId}]` : ''}`).join('; ') || 'none added yet'}.`,
+    `Current medications: ${list.map(m => `${m.name}${m.ingredients?.length ? ` [active ingredient: ${m.ingredients.map(i => i.name).join(' + ')}]` : ''}${m.dose ? ' ' + m.dose : ''} at ${m.times.join(', ')}${m.reason ? ` for ${m.reason}` : ''}${m.instructions ? ` (${m.instructions})` : ''}${m.trialId ? ` [clinical trial ${m.trialId}]` : ''}`).join('; ') || 'none added yet'}.`,
     `Last 7 days: ${r.adherence ?? 'n/a'}% of doses taken (${r.taken}/${r.scheduled}), streak ${r.streak} days, average mood ${r.moodAvg ?? 'n/a'}/5, side effects: ${r.sideEffects.map(x => `${x.name} on ${x.count} days`).join(', ') || 'none reported'}${r.flagged.length ? `; flagged 3+ days: ${r.flagged.join(', ')}` : ''}.`,
+    r.vitals.length ? `Measurements, last 7 days: ${r.vitals.map(v => `${v.label} latest ${vitalText(v.latest)} ${v.unit}${v.type === 'glucose' && v.latest.context ? ` (${v.latest.context})` : ''}, average ${v.avg}${v.avg2 ? '/' + v.avg2 : ''}${v.flagged ? `, ${v.flagged} flagged` : ''}`).join('; ')}.` : '',
+    r.effects.length ? `Side effects reported in detail: ${r.effects.slice(0, 6).map(e => `${e.name} (${e.severity}, from ${e.startDate}${e.endDate ? ` to ${e.endDate}` : ', ongoing'}${e.suspects.length ? `, suspected: ${e.suspects.map(x => x.name).join(', ')}` : ''}${isSerious(e) ? ', SERIOUS' : ''})`).join('; ')}.` : '',
+    feel.length ? `How they said they felt after recent doses (1 = awful, 5 = great): ${feel.map(f => `${f.date} ${f.medName}: ${f.mood}/5${f.sideEffects.length ? `, ${f.sideEffects.join(', ')}` : ''}${f.notes ? ` ("${f.notes.slice(0, 160)}")` : ''}`).join(' | ')}` : '',
     r.notes.length ? `Recent notes: ${r.notes.slice(0, 3).map(n => `${n.date}: ${[n.notes, n.questions && 'Question: ' + n.questions].filter(Boolean).join(' / ')}`).join(' | ')}` : '',
     facts.length ? `FDA label excerpts:\n${facts.join('\n')}` : '',
   ].filter(Boolean).join('\n');
 }
 
-app.post('/api/ai/chat', auth, async (req, res) => {
-  const u = await aiUser(req);
+// Chat answers fast: 3.6 Flash with minimal thinking first (smarter than Flash-Lite, still quick), the reply streamed to the browser as it's written,
+// and the user's context built once and reused (rebuilt when their data changes, or after a minute).
+const CHAT_MODELS = [['gemini-3.6-flash', 'minimal'], [FAST_MODEL, 'minimal'], [GEMINI_MODEL, 'low']];
+async function chatContext(u, q) {
+  const k = String(u._id), c = ctxCache.get(k);
+  if (c && Date.now() - c.at < 60e3) return c.ctx;
+  const ctx = await patientContext(u, q);
+  if (ctxCache.size > 500) ctxCache.clear();
+  ctxCache.set(k, { at: Date.now(), ctx });
+  return ctx;
+}
+function chatInput(req) {
   const msgs = Array.isArray(req.body.messages) ? req.body.messages.slice(-16) : [];
   if (msgs.at(-1)?.role !== 'user') throw bad('Ask Pip a question');
   const contents = msgs.map(m => ({ role: m.role === 'model' ? 'model' : 'user', parts: [{ text: str(m.text, 2000, 'Message') }] }));
+  return { contents, urgent: EMERGENCY.test(contents.at(-1).parts[0].text) };
+}
+const chatSystem = ctx => `${PAL_RULES}\n\nWhat you know about this user from their PillPal account (private):\n${ctx}`;
+// Opening Ask Pip warms the context so the first answer is quick too.
+app.post('/api/ai/warm', auth, async (req, res) => { const u = await aiUser(req); await chatContext(u, req.body).catch(() => {}); res.json({ ok: true }); });
+app.post('/api/ai/chat', auth, async (req, res) => {
+  const u = await aiUser(req), { contents, urgent } = chatInput(req);
   // Emergencies get a fixed safety message first, and still get it if the AI is down.
-  const urgent = EMERGENCY.test(contents.at(-1).parts[0].text);
   let reply = '';
-  try {
-    const ctx = await patientContext(u, req.body);
-    reply = await gemini({ system: `${PAL_RULES}\n\nWhat you know about this user from their PillPal account (private):\n${ctx}`, contents });
-  } catch (e) { if (!urgent) throw e; }
+  try { reply = await gemini({ system: chatSystem(await chatContext(u, req.body)), contents, models: CHAT_MODELS }); } catch (e) { if (!urgent) throw e; }
   res.json({ reply: urgent ? `${SAFETY}${reply ? '\n\n' + reply : ''}` : reply, urgent });
+});
+// Streaming chat (Server-Sent Events): {t: text} chunks as Gemini writes them, then {done: true}.
+app.post('/api/ai/chat/stream', auth, async (req, res) => {
+  const u = await aiUser(req), { contents, urgent } = chatInput(req);
+  res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-cache, no-transform', 'X-Accel-Buffering': 'no', Connection: 'keep-alive' });
+  const send = o => res.write(`data: ${JSON.stringify(o)}\n\n`);
+  if (urgent) send({ t: SAFETY + '\n\n', urgent: true });
+  try { await geminiStream({ system: chatSystem(await chatContext(u, req.body)), contents, models: CHAT_MODELS }, t => send({ t })); }
+  catch (e) { if (!urgent) send({ error: e.message || "Pip's AI is unavailable right now." }); }
+  send({ done: true });
+  res.end();
 });
 const EMERGENCY = /overdos|too many (pills|tablets)|took (\d+|ten|a lot|all)\b|double dose|chest pain|can'?t breathe|trouble breathing|short(ness)? of breath|swell|faint|pass(ed)? out|seizure|suicid|kill myself|end my life|self[- ]?harm|poison/i;
 const SAFETY = 'If this is an emergency, call 911 now. For a possible overdose or poisoning, call Poison Help at 1-800-222-1222 (free, 24/7). For a mental health crisis, call or text 988.';
 
 // What Gemini must return for a label photo. Strict schema = predictable fields; values are still cross-checked below.
-const STR = { type: 'STRING' }, NUM = { type: 'NUMBER', nullable: true };
+const STR = STR_T, NUM = { type: 'NUMBER', nullable: true };
 const LABEL_SCHEMA = { type: 'OBJECT', required: ['found', 'drugName'], properties: {
   found: { type: 'BOOLEAN' }, drugName: STR, genericName: STR, strength: STR, dosageForm: STR, directions: STR, ndc: STR,
   quantity: NUM, refills: NUM, unitsPerDose: NUM, dosesPerDay: NUM, asNeeded: { type: 'BOOLEAN' },
@@ -668,7 +1184,7 @@ app.post('/api/ai/scan', auth, async (req, res) => {
   const t0 = Date.now();
   const o = await gemini({ models: SCAN_MODELS,
     system: 'You read pharmacy and medication labels from photos. Copy text exactly as printed. Never guess text you cannot see: leave a field "" (or null for numbers) unless you can read it on the label.',
-    json: true, temperature: 0.1, schema: LABEL_SCHEMA,
+    json: true, schema: LABEL_SCHEMA,
     contents: [{ role: 'user', parts: [
       { inline_data: { mime_type: `image/${m[1]}`, data: m[2] } },
       { text: 'Read the medication label in this photo. found = false if no medication label is readable. drugName and genericName as printed; strength like "20 mg"; directions = the "take..." line verbatim; ndc as printed; quantity and refills as numbers; unitsPerDose (tablets or capsules per dose) and dosesPerDay only if the directions state them; asNeeded = true for "as needed" / PRN; fillDate, discardAfter ("discard after" / "use by") and expiration as YYYY-MM-DD; lot; pharmacy; rxNumber; pillDescription = any printed description of how the pill looks; warnings = short warning-sticker texts.' },
@@ -702,14 +1218,14 @@ app.post('/api/ai/explain', auth, async (req, res) => {
   if (!name) throw bad('Which medication?');
   const facts = await labelFacts(name);
   const o = await ask(`Explain the medication "${name}" to a patient in plain language.${facts ? `\nGround your answer in this FDA label excerpt:\n${facts}` : ''}
-Return JSON: {"simple": "2-3 sentences: what it is and what it does in the body", "tips": ["3 short practical tips for taking it well"], "askDoctor": ["2 short questions worth asking a pharmacist or doctor"]}`, { json: true, temperature: 0.4, models: [[GEMINI_MODEL, 'low'], [GEMINI_MODEL, 'low'], ['gemini-2.5-flash', 'low']] });
+Return JSON: {"simple": "2-3 sentences: what it is and what it does in the body", "tips": ["3 short practical tips for taking it well"], "askDoctor": ["2 short questions worth asking a pharmacist or doctor"]}`, { json: true, models: [[GEMINI_MODEL, 'low'], [GEMINI_MODEL, 'low'], ['gemini-3.6-flash', 'low'], [FAST_MODEL, 'low']] });
   res.json({ simple: s(o.simple, 700), tips: arr(o.tips), askDoctor: arr(o.askDoctor) });
 });
 
 app.post('/api/ai/insight', auth, async (req, res) => {
   const u = await aiUser(req);
   const ctx = await patientContext(u, req.body, { labels: false });
-  const note = await ask(`${ctx}\n\nThey just saved today's check-in. Write Pip's note: 2-3 warm sentences reacting specifically to their adherence, mood and any side effects, then one tiny practical tip. If a side effect is flagged, gently suggest mentioning it to their care team. Plain text, no lists, under 70 words.`, { temperature: 0.8 });
+  const note = await ask(`${ctx}\n\nThey just saved today's check-in. Write Pip's note: 2-3 warm sentences reacting specifically to their adherence, mood and any side effects, then one tiny practical tip. If a side effect is flagged, gently suggest mentioning it to their care team. Plain text, no lists, under 70 words.`);
   res.json({ note: s(note, 800) });
 });
 
@@ -718,9 +1234,11 @@ app.post('/api/ai/visit-prep', auth, async (req, res) => {
   const r = await reportFor(u._id, req.body);
   const data = { days: r.days, from: r.from, to: r.to, adherence: r.adherence, taken: r.taken, scheduled: r.scheduled,
     meds: r.meds.map(m => ({ name: m.name, dose: m.dose, for: m.reason, trial: m.trialId, adherence: m.adherence, missed: m.missed, skipped: m.skipped })),
-    sideEffects: r.sideEffects, flagged: r.flagged, moodAvg: r.moodAvg, notes: r.notes.slice(0, 8) };
+    sideEffects: r.sideEffects, flagged: r.flagged, moodAvg: r.moodAvg, notes: r.notes.slice(0, 8),
+    measurements: r.vitals.map(v => ({ what: v.label, unit: v.unit, count: v.count, first: vitalText(v.first), latest: vitalText(v.latest), avg: v.avg2 ? `${v.avg}/${v.avg2}` : v.avg, flagged: v.flagged })),
+    sideEffectDetails: r.effects.map(e => ({ name: e.name, severity: e.severity, start: e.startDate, end: e.endDate || 'ongoing', suspected: e.suspects.map(x => x.name), serious: isSerious(e) })) };
   const o = await ask(`Self-reported medication data from PillPal:\n${JSON.stringify(data)}
-Return JSON: {"summary": "3-4 neutral, factual sentences a clinician can skim: adherence overall and per medication if notable, recurring symptoms, mood trend. No advice, no diagnosis.", "questions": ["3-5 questions the patient could ask at their visit, written in first person"]}`, { json: true, temperature: 0.3 });
+Return JSON: {"summary": "3-4 neutral, factual sentences a clinician can skim: adherence overall and per medication if notable, recurring symptoms, mood trend. No advice, no diagnosis.", "questions": ["3-5 questions the patient could ask at their visit, written in first person"]}`, { json: true });
   res.json({ summary: s(o.summary, 1200), questions: arr(o.questions) });
 });
 
@@ -730,4 +1248,4 @@ app.use((err, req, res, next) => {
   res.status(err.status || 500).json({ error: err.status ? err.message : 'Something went wrong on our side' });
 });
 
-app.listen(PORT, () => console.log(`PillPal running at http://localhost:${PORT}`));
+app.listen(PORT, () => { console.log(`PillPal running at http://localhost:${PORT}`); checkGemini(); });
